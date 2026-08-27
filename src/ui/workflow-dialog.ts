@@ -697,6 +697,17 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
       width,
     ),
   );
+  // Heartbeat: name the in-flight agent the run is waiting on, so a long agent
+  // reads as live rather than hung. Only while the run is still going.
+  if (input.task.status === "running" || input.task.status === "paused") {
+    for (let i = input.progress.length - 1; i >= 0; i--) {
+      const entry = input.progress[i];
+      if (entry.type === "run_status" && entry.state === "heartbeat" && entry.agentLabel) {
+        lines.push(clampLine([{ text: `  waiting on ${entry.agentLabel}`, color: "dim" }], width));
+        break;
+      }
+    }
+  }
   lines.push([]);
 
   const frameWidth = width - 1;

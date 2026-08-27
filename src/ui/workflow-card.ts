@@ -329,6 +329,21 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
 
   if (head.subtext) lines.push(clampLine([{ text: `  ${head.subtext}`, color: "dim" }], width));
 
+  // ---- Heartbeat: the run is alive and waiting on one agent in particular. ----
+  // The runtime emits a periodic `run_status` heartbeat naming the in-flight
+  // agent, so a long agent reads as "still working" rather than "dead". Only
+  // shown while the run is actually running — a settled run has nothing to
+  // wait on.
+  if (input.task.status === "running" || input.task.status === "paused") {
+    for (let i = input.progress.length - 1; i >= 0; i--) {
+      const entry = input.progress[i];
+      if (entry.type === "run_status" && entry.state === "heartbeat" && entry.agentLabel) {
+        lines.push(clampLine([{ text: `  ${glyphs.running} waiting on ${entry.agentLabel}`, color: "dim" }], width));
+        break;
+      }
+    }
+  }
+
   // ---- Phase tree ----
   // Stats line up in one column across the whole card, not per group, so the
   // eye can scan them; a label past the cap just pushes its own stats along.

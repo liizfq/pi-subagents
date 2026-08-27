@@ -48,6 +48,8 @@ const IDLE_WARN_MS = 3 * 60_000;
 const IDLE_STALLED_MS = 10 * 60_000;
 /** Idle before the run is killed as timed out. */
 const PHASE_TIMEOUT_MS = 30 * 60_000;
+/** Heartbeat cadence: a periodic liveness signal naming the agent being waited on. */
+const HEARTBEAT_INTERVAL_MS = 60_000;
 
 export class WorkflowRuntimeError extends Error {}
 
@@ -362,6 +364,12 @@ export interface RunWorkflowOptions {
   idleStalledMs?: number;
   /** Idle before the run is killed as timed out. Defaults to 30min. */
   phaseTimeoutMs?: number;
+  /**
+   * Heartbeat cadence while the run is waiting on an in-flight agent. A
+   * periodic `run_status` heartbeat names the agent the run is waiting on, so
+   * a long agent stops looking like a dead run. 0 disables. Defaults to 60s.
+   */
+  heartbeatIntervalMs?: number;
 }
 
 export interface WorkflowRunResult {
@@ -528,6 +536,25 @@ function lastProgressAt(entries: readonly WorkflowEntry[], fallback: number): nu
     if (stamp !== undefined && stamp > last) last = stamp;
   }
   return last;
+}
+
+/**
+ * The label of the most recent in-flight agent, for the heartbeat's
+ * "waiting on …". Last write wins, so the newest `start`/`progress` entry is
+ * the one the run is currently blocked on.
+ */
+function waitingAgentLabel(entries: readonly WorkflowEntry[]): string | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (
+      entry.type === "workflow_agent"
+      && (entry.state === "start" || entry.state === "progress")
+      && entry.label !== undefined
+    ) {
+      return entry.label;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -814,6 +841,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
 
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     let watchdog: ReturnType<typeof setInterval> | undefined;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
     let abortAckTimer: ReturnType<typeof setTimeout> | undefined;
     let abortAcked = false;
 
@@ -826,6 +854,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       if (graceTimer !== undefined) clearTimeout(graceTimer);
       if (abortAckTimer !== undefined) clearTimeout(abortAckTimer);
       if (watchdog !== undefined) clearInterval(watchdog);
+      if (heartbeat !== undefined) clearInterval(heartbeat);
       options.signal?.removeEventListener("abort", onAbort);
       // Symmetric with `semaphore.drain()` below: everything parked is woken so
       // it observes the settle and unwinds. Nothing depends on it — the run's
@@ -922,6 +951,20 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       }
       watchdogState = "idle";
     }, watchdogIntervalMs);
+
+    // Heartbeat: while the run waits on an in-flight agent, name it every
+    // interval so a long agent reads as "still working" rather than "dead".
+    // Deliberately lighter than the watchdog — a heartbeat never settles the
+    // run, it only says what the run is waiting on.
+    const heartbeatIntervalMs = options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
+    if (heartbeatIntervalMs > 0) {
+      heartbeat = setInterval(() => {
+        if (settled) return;
+        const agentLabel = waitingAgentLabel(progress);
+        if (agentLabel === undefined) return;
+        emit([{ type: "run_status", state: "heartbeat", idleMs: 0, agentLabel }]);
+      }, heartbeatIntervalMs);
+    }
 
     if (options.signal) {
       if (options.signal.aborted) {

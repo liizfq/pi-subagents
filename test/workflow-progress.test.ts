@@ -105,6 +105,15 @@ describe("run_status entries", () => {
   it("is ignored by stats", () => {
     expect(stats([runStatus()])).toMatchObject({ done: 0, total: 0, started: 0 });
   });
+
+  it("treats a heartbeat entry like any other run_status — not a phase or log", () => {
+    const heartbeat = { type: "run_status", state: "heartbeat", idleMs: 0, agentLabel: "audit" } as unknown as WorkflowEntry;
+    const { agents, logs, phaseTitles } = collapse([heartbeat]);
+    expect(agents).toHaveLength(0);
+    expect(logs).toHaveLength(0);
+    expect([...phaseTitles.entries()]).toHaveLength(0);
+    expect(buildPhaseGroups([heartbeat])).toHaveLength(0);
+  });
 });
 
 describe("displayState", () => {

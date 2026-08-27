@@ -89,6 +89,8 @@ How a script converges is up to it, but the shape that works is the same every t
 
 A run that goes quiet for a long stretch is watched rather than silently hung: idle for three minutes it emits an idle warning, for ten it is flagged **stalled** (a warning, not a completion — the run keeps going and stays reachable from the inspector), and with thirty minutes of no agent activity it is stopped as timed out. These are defaults, not promises — they are tunable in the runtime, not in the tool call.
 
+While a run is waiting on a particular agent, it also beats a **heartbeat**: every minute the card and inspector name the in-flight agent (`waiting on audit:auth`), so a long agent reads as still working rather than dead. The heartbeat is liveness, the watchdog is judgement — one says what the run is waiting on, the other decides when waiting has gone on too long.
+
 The fifth key only shows you something:
 
 | Key | |

@@ -49,11 +49,13 @@ export interface WorkflowLogEntry {
   message: string;
 }
 
-/** A watchdog notice: the run is idle but still going. Never a terminal state. */
+/** A watchdog or heartbeat notice: the run is idle or waiting but still going. Never a terminal state. */
 export interface WorkflowRunStatusEntry {
   type: "run_status";
-  state: "idle_warning" | "stalled";
+  state: "idle_warning" | "stalled" | "heartbeat";
   idleMs: number;
+  /** The agent the run is currently waiting on, for a heartbeat. */
+  agentLabel?: string;
 }
 
 export interface WorkflowAgentEntry {

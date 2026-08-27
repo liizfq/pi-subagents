@@ -901,6 +901,82 @@ describe("watchdog", () => {
   });
 });
 
+describe("heartbeat", () => {
+  it("names the in-flight agent it is waiting on, periodically", async () => {
+    const controller = new AbortController();
+    const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+
+    const heartbeats: string[] = [];
+    let started = () => {};
+    const running = new Promise<void>(resolve => { started = resolve; });
+
+    const promise = run('await agent("long running");\nreturn 1;', {
+      host,
+      signal: controller.signal,
+      heartbeatIntervalMs: 20,
+      onProgress(entries) {
+        if (entries.some(e => e.type === "workflow_agent" && e.startedAt != null)) started();
+        for (const entry of entries) {
+          if (entry.type === "run_status" && entry.state === "heartbeat") {
+            heartbeats.push(entry.agentLabel ?? "");
+          }
+        }
+      },
+    });
+
+    try {
+      await running;
+      // Wait for at least two heartbeat ticks.
+      await sleep(80);
+      expect(heartbeats.length).toBeGreaterThan(0);
+      // Every heartbeat names the same in-flight agent — the one the run waits on.
+      expect(heartbeats.every(label => label === "long running")).toBe(true);
+    } finally {
+      controller.abort();
+      await promise;
+    }
+  });
+
+  it("stops emitting heartbeats once the run settles", async () => {
+    const { host } = stubHost();
+    const heartbeats: string[] = [];
+    const result = await run('return await agent("quick");', {
+      host,
+      heartbeatIntervalMs: 10,
+      onProgress(entries) {
+        for (const entry of entries) {
+          if (entry.type === "run_status" && entry.state === "heartbeat") heartbeats.push(entry.agentLabel ?? "");
+        }
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    const after = heartbeats.length;
+    await sleep(40);
+    // No more heartbeats after a settled run — the interval was cleared.
+    expect(heartbeats.length).toBe(after);
+  });
+
+  it("emits no heartbeat when no agent is in flight", async () => {
+    // A script with no agent() at all must not produce heartbeats.
+    const { host } = stubHost();
+    const heartbeats: string[] = [];
+    const result = await run('return "no agents";', {
+      host,
+      heartbeatIntervalMs: 10,
+      onProgress(entries) {
+        for (const entry of entries) {
+          if (entry.type === "run_status" && entry.state === "heartbeat") heartbeats.push(entry.agentLabel ?? "");
+        }
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    await sleep(40);
+    expect(heartbeats).toHaveLength(0);
+  });
+});
+
 /* ------------------------------------------------------------------------- *
  * Live control — pause, skip, retry
  * ------------------------------------------------------------------------- */

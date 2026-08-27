@@ -1161,4 +1161,21 @@ describe("run_status entries", () => {
     expect(cells(lines).length).toBeGreaterThan(0);
     expect(lines.join("\n")).not.toContain("undefined");
   });
+
+  it("shows the heartbeat's waiting agent while the run is live", () => {
+    const heartbeat = { type: "run_status", state: "heartbeat", idleMs: 0, agentLabel: "audit:auth" } as unknown as WorkflowEntry;
+    const lines = dialog({
+      progress: [heartbeat, agentEntry({ index: 0, label: "audit:auth", state: "start" })],
+    });
+    expect(lines.join("\n")).toContain("waiting on audit:auth");
+  });
+
+  it("hides the heartbeat line once the run has settled", () => {
+    const heartbeat = { type: "run_status", state: "heartbeat", idleMs: 0, agentLabel: "audit:auth" } as unknown as WorkflowEntry;
+    const lines = dialog({
+      progress: [heartbeat, agentEntry({ index: 0, label: "audit:auth", state: "done" })],
+      task: { status: "completed", startTime: START, endTime: START + 500 },
+    });
+    expect(lines.join("\n")).not.toContain("waiting on audit:auth");
+  });
 });
