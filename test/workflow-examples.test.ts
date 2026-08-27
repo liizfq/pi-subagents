@@ -156,6 +156,7 @@ describe("shipped example workflows", () => {
       "fan-out-audit.js",
       "gated-fix.js",
       "review-panel.js",
+      "run-phase.js",
       "structured-findings.js",
     ]);
     expect(childFiles).toEqual(["count-child.js"]);
@@ -246,6 +247,18 @@ describe("shipped example workflows", () => {
       expect(result.agentCount).toBe(1);
       expect(result.value).toMatchObject({ passed: true });
       expect(spawns[0]?.gate).toBe("npm test");
+    });
+
+    it("run-phase converges to a terminal object with the phase wrapper", async () => {
+      const { host, spawns } = stubHost();
+      const result = await runExample("run-phase.js", host);
+
+      // 2 subjects + 1 summary.
+      expect(result.agentCount).toBe(3);
+      expect(result.value).toMatchObject({ ok: true, audited: 2 });
+      // The wrapper's effort tiering is the point of the example.
+      expect(spawns.filter(s => s.effort === "low")).toHaveLength(2);
+      expect(spawns.find(s => s.label === "summarize")?.effort).toBe("high");
     });
 
     it("gated-fix resumes the same child when the gate rejects the work", async () => {

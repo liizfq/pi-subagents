@@ -85,6 +85,8 @@ The **inspector**, at `/agents → Workflows` — two panes, two levels: phases 
 
 Stopping (`x`) is two-stage: the run tells the script to abort and gives it a short window to run its `finally` (and an optional `__onWorkflowAbort` hook the script can assign) before the worker is hard-terminated. A script wedged in a tight loop is killed well before that window ends. Either way the run settles as stopped, and the terminal state — the run-status file, plus a completion notification — is guaranteed even though the script never returned.
 
+How a script converges is up to it, but the shape that works is the same every time: wrap each phase in a `runPhase()`-style `try/catch` that records the outcome, and put a top-level `try/catch/finally` around the whole run that returns a terminal object. Pending `agent()` calls reject on abort as a *catchable fatal error* — not as `null` — so `parallel()`/`pipeline()` rethrow rather than folding an abort into an item and carrying on. Assign `__onWorkflowAbort` if you need to tidy up (persist a report, close handles) inside the grace window. The shipped [`run-phase.js`](../examples/workflows/run-phase.js) shows the whole pattern, and runs in CI so it cannot rot.
+
 A run that goes quiet for a long stretch is watched rather than silently hung: idle for three minutes it emits an idle warning, for ten it is flagged **stalled** (a warning, not a completion — the run keeps going and stays reachable from the inspector), and with thirty minutes of no agent activity it is stopped as timed out. These are defaults, not promises — they are tunable in the runtime, not in the tool call.
 
 The fifth key only shows you something:
@@ -439,6 +441,7 @@ Every file below is executed by `test/workflow-examples.test.ts` against a stub 
 | [`structured-findings.js`](../examples/workflows/structured-findings.js) | `schema` on both stages, objects instead of prose | Yes |
 | [`gated-fix.js`](../examples/workflows/gated-fix.js) | `gate`, `isolation: "worktree"`, `resume` retry loop | Needs a real test command |
 | [`review-panel.js`](../examples/workflows/review-panel.js) | An earned `parallel` barrier, `effort` tiering, `model` | Yes |
+| [`run-phase.js`](../examples/workflows/run-phase.js) | A phase-wrapped script that converges on abort (`runPhase`, top-level `try/finally`, `__onWorkflowAbort`) | Yes |
 | [`compose.js`](../examples/workflows/compose.js) | `workflow()` nesting and `args` plumbing | Needs `lib/count-child.js` saved |
 
 Copy one into `.pi/workflows/` to make it yours.

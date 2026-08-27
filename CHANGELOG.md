@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **An aborted or failed workflow always leaves a terminal record and a notification.** Stopping a run used to hard-kill the worker, so a script's `finally` never ran and nothing recorded the run's end — an abort could go silent for hours. The runtime now gives a stopped script a short grace to converge before terminating it, writes a terminal summary next to the journal (`<run id>.run-status.json`), and notifies on killed/failed exactly as on completed. Idle runs are watched too: an idle warning, then a stalled flag, then stopped as timed out after thirty minutes.
+- **A reference workflow shows the script side of abort convergence.** `examples/workflows/run-phase.js` wraps each phase in a `try/catch` and converges in a top-level `try/finally`, assigning the optional `__onWorkflowAbort` hook — the pattern a script needs so a stopped run still leaves a terminal record. It is executed by the example suite on every CI run.
 
 ## [0.19.0] - 2026-08-25
 
