@@ -861,13 +861,15 @@ describe("abort terminal state", () => {
 });
 
 describe("watchdog", () => {
-  it("warns, then stalls, then kills an idle run on phase timeout", async () => {
+  it("warns, then stalls, then kills a run whose script is wedged with no agent in flight", async () => {
+    // An agent that completes, then a script await that never resolves: no
+    // agent is in flight, so the idle clock runs and the watchdog fires.
     const controller = new AbortController();
-    const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+    const { host } = stubHost();
 
     const statuses: string[] = [];
     const stalled: number[] = [];
-    const promise = run('await agent("hang");\nreturn 1;', {
+    const promise = run('await agent("a");\nawait new Promise(() => {});\nreturn 1;', {
       host,
       signal: controller.signal,
       watchdogIntervalMs: 20,
@@ -897,6 +899,50 @@ describe("watchdog", () => {
       expect(statuses.length).toBe(after);
     } finally {
       controller.abort();
+    }
+  });
+
+  it("does not flag a run whose in-flight agent is quiet but alive", async () => {
+    // An agent that never settles IS the run being busy: the runtime cannot
+    // tell "deep analysis, no progress events" from "hung", so an in-flight
+    // agent must not be marked stalled or killed (a misjudgement would kill
+    // real work — this was reported as a false positive).
+    const controller = new AbortController();
+    const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+
+    const statuses: string[] = [];
+    const stalled: number[] = [];
+    let started = () => {};
+    const running = new Promise<void>(resolve => { started = resolve; });
+
+    const promise = run('await agent("deep analysis");\nreturn 1;', {
+      host,
+      signal: controller.signal,
+      watchdogIntervalMs: 20,
+      idleWarnMs: 30,
+      idleStalledMs: 60,
+      phaseTimeoutMs: 90,
+      onProgress(entries) {
+        if (entries.some(e => e.type === "workflow_agent" && e.startedAt != null)) started();
+        for (const entry of entries) {
+          if (entry.type === "run_status") statuses.push(entry.state);
+        }
+      },
+      onStalled: info => { stalled.push(info.idleMs); },
+    });
+
+    try {
+      await running;
+      // Far past the stalled threshold, and the run is still going — neither
+      // flagged nor killed.
+      await sleep(250);
+      expect(statuses).not.toContain("stalled");
+      expect(statuses).not.toContain("idle_warning");
+      expect(stalled).toHaveLength(0);
+    } finally {
+      controller.abort();
+      const result = await promise;
+      expect(result.status).toBe("killed"); // by the abort, not the watchdog
     }
   });
 });

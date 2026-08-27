@@ -540,19 +540,21 @@ function lastProgressAt(entries: readonly WorkflowEntry[], fallback: number): nu
 
 /**
  * The label of the most recent in-flight agent, for the heartbeat's
- * "waiting on …". Last write wins, so the newest `start`/`progress` entry is
- * the one the run is currently blocked on.
+ * "waiting on …" and the watchdog's idle clock.
+ *
+ * Walks the raw log backwards, skipping superseded entries: the log is
+ * append-only and an agent is re-emitted under the same `index`, so the first
+ * entry seen for an index IS its latest state — an agent whose last write is
+ * `done`/`error` is not in flight even though its earlier `start` entry is
+ * still in the log.
  */
 function waitingAgentLabel(entries: readonly WorkflowEntry[]): string | undefined {
+  const seen = new Set<number>();
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
-    if (
-      entry.type === "workflow_agent"
-      && (entry.state === "start" || entry.state === "progress")
-      && entry.label !== undefined
-    ) {
-      return entry.label;
-    }
+    if (entry.type !== "workflow_agent" || seen.has(entry.index)) continue;
+    seen.add(entry.index);
+    if (entry.state === "start" || entry.state === "progress") return entry.label;
   }
   return undefined;
 }
@@ -919,6 +921,13 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
      * The idle clock: no activity for long enough is a stalled run, not a
      * healthy one. Reads the newest `lastProgressAt` off the log (last write
      * wins), falling back to the run start before any agent has reported.
+     *
+     * A run with an agent in flight is never idle. The runtime cannot tell a
+     * quietly-working agent (deep analysis, no progress events for minutes)
+     * from a hung one, so flagging it would mislabel real work as stalled —
+     * and the phase timeout would then kill it outright. The clock only runs
+     * when no agent is in flight: a script wedged between calls, awaiting a
+     * promise that never resolves, or spinning on its own.
      */
     const watchdogIntervalMs = options.watchdogIntervalMs ?? WATCHDOG_INTERVAL_MS;
     const idleWarnMs = options.idleWarnMs ?? IDLE_WARN_MS;
@@ -927,7 +936,10 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     let watchdogState: "idle" | "warned" | "stalled" = "idle";
     watchdog = setInterval(() => {
       if (settled) return;
-      const idleMs = Date.now() - lastProgressAt(progress, runStartedAt);
+      const idleMs =
+        waitingAgentLabel(progress) === undefined
+          ? Date.now() - lastProgressAt(progress, runStartedAt)
+          : 0;
       if (idleMs > phaseTimeoutMs) {
         finish({ status: "killed", error: `Phase timed out after ${phaseTimeoutMs}ms idle.` });
         return;
