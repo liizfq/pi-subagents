@@ -19,7 +19,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getStuckAiIntervalMs, getStuckAiModel, getStuckDetection, getStuckGraceWindows, getStuckRepeatThreshold, getStuckRuleIntervalMs, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setStuckAiIntervalMs, setStuckAiModel, setStuckDetection, setStuckGraceWindows, setStuckRepeatThreshold, setStuckRuleIntervalMs, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -36,7 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type StuckDetectionMode, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -1426,6 +1426,12 @@ export default function (pi: ExtensionAPI) {
       setShowCost,
       setShowModel,
       setViewerMarkdown,
+      setStuckDetection,
+      setStuckRuleIntervalMs,
+      setStuckRepeatThreshold,
+      setStuckGraceWindows,
+      setStuckAiModel,
+      setStuckAiIntervalMs,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -3528,6 +3534,12 @@ Write the file using the write tool. Only write the file, nothing else.`;
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
+      stuckDetection: getStuckDetection(),
+      stuckRuleIntervalMs: getStuckRuleIntervalMs(),
+      stuckRepeatThreshold: getStuckRepeatThreshold(),
+      stuckGraceWindows: getStuckGraceWindows(),
+      stuckAiModel: getStuckAiModel(),
+      stuckAiIntervalMs: getStuckAiIntervalMs(),
     } satisfies SubagentsSettings;
   }
 
@@ -3544,6 +3556,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
 
   const NUMERIC_IDS = new Set([
     "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
+    "stuckRuleIntervalMs", "stuckRepeatThreshold", "stuckGraceWindows", "stuckAiIntervalMs",
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -3737,6 +3750,52 @@ Write the file using the write tool. Only write the file, nothing else.`;
           currentValue: getToolDescriptionMode(),
           values: ["full", "compact", "custom"],
         },
+        {
+          id: "stuckDetection",
+          label: "Stuck detection",
+          description: "Stuck-agent detection: rules = local rule layer only; rules+ai = rules + an AI reviewer that can clear or confirm a sustained-suspicious run",
+          currentValue: getStuckDetection(),
+          values: ["rules", "rules+ai"],
+        },
+        {
+          id: "stuckRuleIntervalMs",
+          label: "Stuck rule interval",
+          description: "Milliseconds between rule evaluations (default 30000)",
+          currentValue: String(getStuckRuleIntervalMs()),
+          values: [String(getStuckRuleIntervalMs())],
+        },
+        {
+          id: "stuckRepeatThreshold",
+          label: "Stuck repeat threshold",
+          description: "Identical (tool + args) calls within a window that mark it suspicious (default 5)",
+          currentValue: String(getStuckRepeatThreshold()),
+          values: [String(getStuckRepeatThreshold())],
+        },
+        {
+          id: "stuckGraceWindows",
+          label: "Stuck grace windows",
+          description: "Consecutive suspicious windows before the run is aborted (default 3)",
+          currentValue: String(getStuckGraceWindows()),
+          values: [String(getStuckGraceWindows())],
+        },
+        {
+          id: "stuckAiModel",
+          label: "Stuck AI model",
+          description: "Model used to review sustained-suspicious runs (rules+ai mode only)",
+          currentValue: getStuckAiModel(),
+          values: (() => {
+            const models = ctx.modelRegistry.getAvailable?.() ?? ctx.modelRegistry.getAll();
+            const names = models.map((m: { provider: string; id: string }) => `${m.provider}/${m.id}`);
+            return names.length > 0 ? names : [getStuckAiModel()];
+          })(),
+        },
+        {
+          id: "stuckAiIntervalMs",
+          label: "Stuck AI interval",
+          description: "Minimum milliseconds between AI reviews of one agent (default 600000)",
+          currentValue: String(getStuckAiIntervalMs()),
+          values: [String(getStuckAiIntervalMs())],
+        },
       ];
     }
 
@@ -3898,6 +3957,39 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "widgetMode") {
         setWidgetMode(value as WidgetMode);
         notifyApplied(ctx, `Widget set to ${value}`);
+      } else if (id === "stuckDetection") {
+        setStuckDetection(value as StuckDetectionMode);
+        notifyApplied(ctx, `Stuck detection set to ${value}`);
+      } else if (id === "stuckRuleIntervalMs") {
+        const n = parseInt(value, 10);
+        if (n >= 1000) {
+          setStuckRuleIntervalMs(n);
+          notifyApplied(ctx, `Stuck rule interval set to ${n}ms`);
+        }
+      } else if (id === "stuckRepeatThreshold") {
+        const n = parseInt(value, 10);
+        if (n >= 2) {
+          setStuckRepeatThreshold(n);
+          notifyApplied(ctx, `Stuck repeat threshold set to ${n}`);
+        }
+      } else if (id === "stuckGraceWindows") {
+        const n = parseInt(value, 10);
+        if (n >= 1) {
+          setStuckGraceWindows(n);
+          notifyApplied(ctx, `Stuck grace windows set to ${n}`);
+        }
+      } else if (id === "stuckAiModel") {
+        const m = value.trim();
+        if (m) {
+          setStuckAiModel(m);
+          notifyApplied(ctx, `Stuck AI model set to ${m}`);
+        }
+      } else if (id === "stuckAiIntervalMs") {
+        const n = parseInt(value, 10);
+        if (n >= 60000) {
+          setStuckAiIntervalMs(n);
+          notifyApplied(ctx, `Stuck AI interval set to ${n}ms`);
+        }
       }
     }
 
@@ -3955,7 +4047,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? String(getDefaultMaxTurns() ?? 0)
             : result === "maxSubagentDepth"
               ? String(getMaxSubagentDepth())
-              : String(getGraceTurns());
+              : result === "stuckRuleIntervalMs"
+                ? String(getStuckRuleIntervalMs())
+                : result === "stuckRepeatThreshold"
+                  ? String(getStuckRepeatThreshold())
+                  : result === "stuckGraceWindows"
+                    ? String(getStuckGraceWindows())
+                    : result === "stuckAiIntervalMs"
+                      ? String(getStuckAiIntervalMs())
+                      : String(getGraceTurns());
 
       const label = result === "maxConcurrent"
         ? "Max concurrency (1+)"
@@ -3965,7 +4065,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? "Default max turns (0 = unlimited)"
             : result === "maxSubagentDepth"
               ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+              : result === "stuckRuleIntervalMs"
+                ? "Stuck rule interval ms (1000+)"
+                : result === "stuckRepeatThreshold"
+                  ? "Stuck repeat threshold (2+)"
+                  : result === "stuckGraceWindows"
+                    ? "Stuck grace windows (1+)"
+                    : result === "stuckAiIntervalMs"
+                      ? "Stuck AI interval ms (60000+)"
+                      : "Grace turns (1+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.

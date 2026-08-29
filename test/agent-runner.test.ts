@@ -138,6 +138,7 @@ import {
   setGraceTurns,
   setRememberAgents,
 } from "../src/agent-runner.js";
+import type { StuckDetectorEvaluation } from "../src/stuck-detector.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -2670,6 +2671,160 @@ describe("agent-runner abort signal forwarding", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     expect(session.abort).not.toHaveBeenCalled();
+  });
+
+  it("feeds tool, text, and turn events to an injected stuck detector", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const detector = {
+      record: vi.fn(),
+      evaluate: vi.fn(() => ({ status: "healthy", suspicious: false, suspiciousWindows: 0 })),
+      reset: vi.fn(),
+    };
+
+    session.prompt.mockImplementation(async () => {
+      for (const listener of listeners) {
+        listener({ type: "tool_execution_start", toolName: "read", args: { path: "one.ts" } });
+        listener({ type: "tool_execution_end", toolName: "read", result: "ok", isError: false });
+        listener({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "progress" },
+        });
+        listener({ type: "turn_end" });
+      }
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
+    });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      stuckDetection: "rules",
+      stuckDetector: detector,
+    } as any);
+
+    expect(detector.record).toHaveBeenCalledWith(expect.objectContaining({
+      type: "tool_start",
+      toolName: "read",
+      args: { path: "one.ts" },
+    }));
+    expect(detector.record).toHaveBeenCalledWith(expect.objectContaining({
+      type: "tool_end",
+      toolName: "read",
+      isError: false,
+    }));
+    expect(detector.record).toHaveBeenCalledWith(expect.objectContaining({
+      type: "text",
+      delta: "progress",
+    }));
+    expect(detector.record).toHaveBeenCalledWith(expect.objectContaining({ type: "turn" }));
+  });
+});
+
+// Stuck detection must ask the agent to wrap up before giving it a hard stop.
+// The first stuck evaluation sends the steer; a later evaluation decides whether
+// the agent made progress or needs to be aborted.
+describe("agent-runner stuck steer grace", () => {
+  const intervalMs = 10;
+  const stuck: StuckDetectorEvaluation = {
+    status: "stuck",
+    suspicious: true,
+    suspiciousWindows: 3,
+    reason: "repeated-call",
+  };
+  const healthy: StuckDetectorEvaluation = {
+    status: "healthy",
+    suspicious: false,
+    suspiciousWindows: 0,
+  };
+
+  async function startRun(detector: {
+    record: ReturnType<typeof vi.fn>;
+    evaluate: ReturnType<typeof vi.fn>;
+    reset: ReturnType<typeof vi.fn>;
+  }) {
+    vi.useFakeTimers();
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, listeners } = createSession("");
+    createAgentSession.mockResolvedValue({ session });
+
+    let finishPrompt: (() => void) | undefined;
+    let promptStarted!: () => void;
+    const promptReady = new Promise<void>(resolve => { promptStarted = resolve; });
+    session.prompt.mockImplementation(() => {
+      promptStarted();
+      return new Promise<void>(resolve => { finishPrompt = resolve; });
+    });
+    session.abort.mockImplementation(() => finishPrompt?.());
+
+    const runPromise = runAgent(ctx, "Explore", "go", {
+      pi,
+      stuckDetection: "rules",
+      stuckRuleIntervalMs: intervalMs,
+      stuckDetector: detector,
+    } as any);
+    await promptReady;
+
+    return {
+      session,
+      listeners,
+      runPromise,
+      finish: () => finishPrompt?.(),
+    };
+  }
+
+  it("steers on the first stuck evaluation and aborts only on the next window", async () => {
+    const detector = {
+      record: vi.fn(),
+      evaluate: vi.fn(() => stuck),
+      reset: vi.fn(),
+    };
+    const run = await startRun(detector);
+
+    try {
+      await vi.advanceTimersByTimeAsync(intervalMs);
+      expect(run.session.steer).toHaveBeenCalledTimes(1);
+      expect(run.session.abort).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(intervalMs);
+      expect(run.session.abort).toHaveBeenCalledTimes(1);
+    } finally {
+      run.finish();
+      await run.runPromise;
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the pending abort when text progress arrives after steering", async () => {
+    let progressed = false;
+    const detector = {
+      record: vi.fn((event: { type?: string }) => {
+        if (event.type === "text") progressed = true;
+      }),
+      evaluate: vi.fn(() => progressed ? healthy : stuck),
+      reset: vi.fn(),
+    };
+    const run = await startRun(detector);
+
+    try {
+      await vi.advanceTimersByTimeAsync(intervalMs);
+      expect(run.session.steer).toHaveBeenCalledTimes(1);
+      expect(run.session.abort).not.toHaveBeenCalled();
+
+      for (const listener of run.listeners) {
+        listener({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "progress" },
+        });
+      }
+      await vi.advanceTimersByTimeAsync(intervalMs);
+
+      expect(detector.evaluate).toHaveBeenCalledTimes(2);
+      expect(run.session.abort).not.toHaveBeenCalled();
+    } finally {
+      run.finish();
+      await run.runPromise;
+      vi.useRealTimers();
+    }
   });
 });
 

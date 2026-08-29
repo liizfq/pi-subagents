@@ -6,10 +6,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
-import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
+import type { AgentMentionMode, JoinMode, StuckDetectionMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
   maxConcurrent?: number;
+  stuckDetection?: StuckDetectionMode;
+  stuckRuleIntervalMs?: number;
+  stuckRepeatThreshold?: number;
+  stuckGraceWindows?: number;
+  stuckAiModel?: string;
+  stuckAiIntervalMs?: number;
   /**
    * Max concurrent FOREGROUND (blocking) agents — `0` = unlimited, the default,
    * which preserves the behaviour that has always applied: nothing bounded
@@ -332,6 +338,12 @@ export interface SettingsAppliers {
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
+  setStuckDetection?: (mode: StuckDetectionMode) => void;
+  setStuckRuleIntervalMs?: (n: number) => void;
+  setStuckRepeatThreshold?: (n: number) => void;
+  setStuckGraceWindows?: (n: number) => void;
+  setStuckAiModel?: (model: string) => void;
+  setStuckAiIntervalMs?: (n: number) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -342,6 +354,11 @@ const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptio
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
+const VALID_STUCK_DETECTION_MODES: ReadonlySet<string> = new Set<StuckDetectionMode>(["rules", "rules+ai"]);
+const STUCK_RULE_INTERVAL_CEILING = 300_000;
+const STUCK_REPEAT_THRESHOLD_CEILING = 50;
+const STUCK_GRACE_WINDOWS_CEILING = 60;
+const STUCK_AI_INTERVAL_CEILING = 3_600_000;
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -451,6 +468,24 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
+  if (typeof r.stuckDetection === "string" && VALID_STUCK_DETECTION_MODES.has(r.stuckDetection)) {
+    out.stuckDetection = r.stuckDetection as StuckDetectionMode;
+  }
+  if (Number.isInteger(r.stuckRuleIntervalMs) && (r.stuckRuleIntervalMs as number) >= 1_000 && (r.stuckRuleIntervalMs as number) <= STUCK_RULE_INTERVAL_CEILING) {
+    out.stuckRuleIntervalMs = r.stuckRuleIntervalMs as number;
+  }
+  if (Number.isInteger(r.stuckRepeatThreshold) && (r.stuckRepeatThreshold as number) >= 2 && (r.stuckRepeatThreshold as number) <= STUCK_REPEAT_THRESHOLD_CEILING) {
+    out.stuckRepeatThreshold = r.stuckRepeatThreshold as number;
+  }
+  if (Number.isInteger(r.stuckGraceWindows) && (r.stuckGraceWindows as number) >= 1 && (r.stuckGraceWindows as number) <= STUCK_GRACE_WINDOWS_CEILING) {
+    out.stuckGraceWindows = r.stuckGraceWindows as number;
+  }
+  if (typeof r.stuckAiModel === "string" && (r.stuckAiModel as string).trim()) {
+    out.stuckAiModel = (r.stuckAiModel as string).trim();
+  }
+  if (Number.isInteger(r.stuckAiIntervalMs) && (r.stuckAiIntervalMs as number) >= 60_000 && (r.stuckAiIntervalMs as number) <= STUCK_AI_INTERVAL_CEILING) {
+    out.stuckAiIntervalMs = r.stuckAiIntervalMs as number;
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -537,6 +572,12 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
+  if (s.stuckDetection) appliers.setStuckDetection?.(s.stuckDetection);
+  if (typeof s.stuckRuleIntervalMs === "number") appliers.setStuckRuleIntervalMs?.(s.stuckRuleIntervalMs);
+  if (typeof s.stuckRepeatThreshold === "number") appliers.setStuckRepeatThreshold?.(s.stuckRepeatThreshold);
+  if (typeof s.stuckGraceWindows === "number") appliers.setStuckGraceWindows?.(s.stuckGraceWindows);
+  if (typeof s.stuckAiModel === "string") appliers.setStuckAiModel?.(s.stuckAiModel);
+  if (typeof s.stuckAiIntervalMs === "number") appliers.setStuckAiIntervalMs?.(s.stuckAiIntervalMs);
 }
 
 /**

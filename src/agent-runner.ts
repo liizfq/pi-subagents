@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
@@ -23,11 +23,13 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { resolveModel } from "./model-resolver.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import { createStuckDetector, type StuckDetector } from "./stuck-detector.js";
+import type { StuckDetectionMode, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -357,6 +359,53 @@ export function getGraceTurns(): number { return graceTurns; }
 /** Set the grace turns value (minimum 1). */
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
+/** Default rule-evaluation period for stuck detection. */
+const DEFAULT_STUCK_RULE_INTERVAL_MS = 30_000;
+/** Default number of identical calls needed to flag a window. */
+const DEFAULT_STUCK_REPEAT_THRESHOLD = 5;
+/** Default number of suspicious windows before a rules-only abort. */
+const DEFAULT_STUCK_GRACE_WINDOWS = 3;
+/** Default model used by the optional stuck reviewer. */
+const DEFAULT_STUCK_AI_MODEL = "deepseek-v4-flash";
+/** Default minimum interval between AI reviews for one agent. */
+const DEFAULT_STUCK_AI_INTERVAL_MS = 600_000;
+const STUCK_RULE_INTERVAL_CEILING = 300_000;
+const STUCK_REPEAT_THRESHOLD_CEILING = 50;
+const STUCK_GRACE_WINDOWS_CEILING = 60;
+const STUCK_AI_INTERVAL_CEILING = 3_600_000;
+
+let stuckDetection: StuckDetectionMode = "rules";
+let stuckRuleIntervalMs = DEFAULT_STUCK_RULE_INTERVAL_MS;
+let stuckRepeatThreshold = DEFAULT_STUCK_REPEAT_THRESHOLD;
+let stuckGraceWindows = DEFAULT_STUCK_GRACE_WINDOWS;
+let stuckAiModel = DEFAULT_STUCK_AI_MODEL;
+let stuckAiIntervalMs = DEFAULT_STUCK_AI_INTERVAL_MS;
+
+export function getStuckDetection(): StuckDetectionMode { return stuckDetection; }
+export function setStuckDetection(mode: StuckDetectionMode): void {
+  if (mode === "rules" || mode === "rules+ai") stuckDetection = mode;
+}
+export function getStuckRuleIntervalMs(): number { return stuckRuleIntervalMs; }
+export function setStuckRuleIntervalMs(n: number): void {
+  if (Number.isFinite(n)) stuckRuleIntervalMs = Math.min(STUCK_RULE_INTERVAL_CEILING, Math.max(1_000, Math.floor(n)));
+}
+export function getStuckRepeatThreshold(): number { return stuckRepeatThreshold; }
+export function setStuckRepeatThreshold(n: number): void {
+  if (Number.isFinite(n)) stuckRepeatThreshold = Math.min(STUCK_REPEAT_THRESHOLD_CEILING, Math.max(2, Math.floor(n)));
+}
+export function getStuckGraceWindows(): number { return stuckGraceWindows; }
+export function setStuckGraceWindows(n: number): void {
+  if (Number.isFinite(n)) stuckGraceWindows = Math.min(STUCK_GRACE_WINDOWS_CEILING, Math.max(1, Math.floor(n)));
+}
+export function getStuckAiModel(): string { return stuckAiModel; }
+export function setStuckAiModel(model: string): void {
+  if (model.trim()) stuckAiModel = model.trim();
+}
+export function getStuckAiIntervalMs(): number { return stuckAiIntervalMs; }
+export function setStuckAiIntervalMs(n: number): void {
+  if (Number.isFinite(n)) stuckAiIntervalMs = Math.min(STUCK_AI_INTERVAL_CEILING, Math.max(60_000, Math.floor(n)));
+}
+
 /**
  * Try to find the right model for an agent type.
  * Priority: explicit option > config.model > parent model.
@@ -401,6 +450,14 @@ export interface RunOptions {
   agentId?: string;
   model?: Model<any>;
   maxTurns?: number;
+  stuckDetection?: StuckDetectionMode;
+  stuckRuleIntervalMs?: number;
+  stuckRepeatThreshold?: number;
+  stuckGraceWindows?: number;
+  stuckAiModel?: string;
+  stuckAiIntervalMs?: number;
+  stuckDetector?: StuckDetector;
+  onStuckState?: (state: "suspicious" | "stuck" | undefined) => void;
   signal?: AbortSignal;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -1049,16 +1106,192 @@ export async function runAgent(
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
   let softLimitReached = false;
   let aborted = false;
+  let stuckAbortReason: string | undefined;
+
+  const detectionMode = options.stuckDetection ?? stuckDetection;
+  const detectionInterval = Math.max(1, Math.floor(options.stuckRuleIntervalMs ?? stuckRuleIntervalMs));
+  const aiInterval = Math.max(1, Math.floor(options.stuckAiIntervalMs ?? stuckAiIntervalMs));
+  const detector = options.stuckDetector ?? createStuckDetector({
+    windowMs: detectionInterval,
+    repeatThreshold: Math.max(1, Math.floor(options.stuckRepeatThreshold ?? stuckRepeatThreshold)),
+    graceWindows: Math.max(1, Math.floor(options.stuckGraceWindows ?? stuckGraceWindows)),
+    initialAt: Date.now(),
+  });
+  const activity: { at: number; toolName?: string; kind: "tool_start" | "tool_end" | "text" | "turn"; text?: string }[] = [];
+  let lastAiReviewAt = -Infinity;
+  let aiReviewInFlight = false;
+  let stuckSteerSent = false;
+  let stuckAbortPending = false;
+  let settled = false;
+  let detectionTimer: ReturnType<typeof setInterval> | undefined;
+
+  const rememberActivity = (sample: typeof activity[number]) => {
+    activity.push(sample);
+    const cutoff = Date.now() - Math.max(detectionInterval, aiInterval);
+    while (activity.length > 100 && activity[0].at < cutoff) activity.shift();
+    if (activity.length > 200) activity.splice(0, activity.length - 200);
+  };
+
+  const activitySummary = (): string => {
+    const recent = activity.slice(-40);
+    const lines = recent.map(sample => {
+      if (sample.kind === "text") {
+        const fragment = (sample.text ?? "").slice(-120);
+        return `${sample.at}: assistant text progress${fragment ? ` · tail: ${fragment}` : ""}`;
+      }
+      if (sample.kind === "turn") return `${sample.at}: turn ended`;
+      return `${sample.at}: ${sample.kind} ${sample.toolName ?? "unknown tool"}`;
+    });
+    return lines.join("\n").slice(-4_000) || "No recent activity.";
+  };
+
+  const parseStuckVerdict = (response: { content: unknown }): boolean | undefined => {
+    const text = Array.isArray(response.content)
+      ? response.content
+        .filter((part): part is { type: "text"; text: string } =>
+          typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string")
+        .map(part => part.text)
+        .join("\n")
+      : "";
+    const jsonText = text.match(/\{[\s\S]*\}/)?.[0];
+    if (!jsonText) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(jsonText);
+      if (typeof parsed === "object" && parsed !== null && typeof (parsed as { stuck?: unknown }).stuck === "boolean") {
+        return (parsed as { stuck: boolean }).stuck;
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  };
+
+  const requestSteer = (message: string): void => {
+    try {
+      void Promise.resolve(session.steer(message)).catch(() => {});
+    } catch {
+      // A partially mocked or already-disposed session cannot accept steering.
+    }
+  };
+
+  const reviewWithAi = async (): Promise<boolean | undefined> => {
+    if (detectionMode !== "rules+ai" || aiReviewInFlight || Date.now() - lastAiReviewAt < aiInterval) {
+      return undefined;
+    }
+    const modelInput = options.stuckAiModel ?? stuckAiModel;
+    let resolved: Model<any> | string;
+    try {
+      resolved = resolveModel(modelInput, ctx.modelRegistry);
+    } catch {
+      return undefined;
+    }
+    if (typeof resolved === "string") return undefined;
+    aiReviewInFlight = true;
+    lastAiReviewAt = Date.now();
+    // Fail-safe: race complete() against a 15s timeout so the reviewer
+    // resolves deterministically even if the provider ignores AbortSignal.
+    const timeout = new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("stuck AI review timed out after 15s")), 15_000));
+    try {
+      const userMessage: UserMessage = {
+        role: "user",
+        content: [{
+          type: "text",
+          text: "Determine whether this subagent is genuinely stuck. Reply with JSON only: {\"stuck\":true} or {\"stuck\":false}. " +
+            "Tool arguments are intentionally omitted; judge only the activity pattern.\n\n" + activitySummary(),
+        }],
+        timestamp: Date.now(),
+      };
+      const response = await Promise.race([
+        ctx.modelRegistry.complete(
+          resolved,
+          {
+            systemPrompt: "You are a conservative subagent liveness reviewer. Do not infer secrets or request tool arguments.",
+            messages: [userMessage],
+          },
+          { signal: AbortSignal.timeout(15_000) },
+        ),
+        timeout,
+      ]);
+      return parseStuckVerdict(response);
+    } catch {
+      // Timeout or provider error: fail-safe — the run stays suspicious, never aborts.
+      return undefined;
+    } finally {
+      aiReviewInFlight = false;
+    }
+  };
+
+  const markStuck = () => {
+    if (aborted || settled || stuckAbortReason !== undefined) return;
+    if (!stuckAbortPending) {
+      stuckAbortPending = true;
+      options.onStuckState?.("stuck");
+      if (!stuckSteerSent) {
+        stuckSteerSent = true;
+        requestSteer("The agent appears stuck. Wrap up immediately — provide your final answer now.");
+      }
+      return;
+    }
+    stuckAbortPending = false;
+    stuckAbortReason = "The agent was aborted after sustained stuck activity.";
+    aborted = true;
+    session.abort();
+  };
+
+  const cancelPendingStuckAbort = (): void => {
+    if (!stuckAbortPending) return;
+    stuckAbortPending = false;
+    stuckSteerSent = false;
+    detector.reset(Date.now());
+    options.onStuckState?.(undefined);
+  };
+
+  const evaluateDetection = async () => {
+    if (!detector || settled || aborted || stuckAbortReason !== undefined) return;
+    const evaluation = detector.evaluate(Date.now());
+    if (evaluation.status === "healthy") {
+      cancelPendingStuckAbort();
+      options.onStuckState?.(undefined);
+      return;
+    }
+    options.onStuckState?.(evaluation.status === "stuck" ? "stuck" : "suspicious");
+    if (stuckAbortPending) {
+      // The steer was sent; only a subsequent still-stuck evaluation may hard
+      // abort. A merely suspicious result gets another window to recover.
+      if (evaluation.status === "stuck") markStuck();
+      return;
+    }
+    if (detectionMode === "rules+ai" && evaluation.suspicious) {
+      const verdict = await reviewWithAi();
+      if (verdict === false) {
+        detector.reset(Date.now());
+        options.onStuckState?.(undefined);
+        return;
+      }
+      if (verdict === true) {
+        markStuck();
+        return;
+      }
+      // An unavailable or timed-out reviewer is not evidence of a stuck agent.
+      return;
+    }
+    if (evaluation.status === "stuck") markStuck();
+  };
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
+    const at = Date.now();
     if (event.type === "turn_end") {
       turnCount++;
+      detector?.record({ type: "turn", at });
+      rememberActivity({ kind: "turn", at });
       options.onTurnEnd?.(turnCount);
       if (maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          requestSteer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
           session.abort();
@@ -1070,12 +1303,21 @@ export async function runAgent(
     }
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       currentMessageText += event.assistantMessageEvent.delta;
+      if (event.assistantMessageEvent.delta.length > 0) cancelPendingStuckAbort();
+      detector?.record({ type: "text", delta: event.assistantMessageEvent.delta, at });
+      rememberActivity({ kind: "text", at, text: currentMessageText.slice(-200) });
       options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
     }
     if (event.type === "tool_execution_start") {
+      cancelPendingStuckAbort();
+      detector?.record({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId, args: event.args, at });
+      rememberActivity({ kind: "tool_start", toolName: event.toolName, at });
       options.onToolActivity?.({ type: "start", toolName: event.toolName });
     }
     if (event.type === "tool_execution_end") {
+      cancelPendingStuckAbort();
+      detector?.record({ type: "tool_end", toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError, at });
+      rememberActivity({ kind: "tool_end", toolName: event.toolName, at });
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
@@ -1092,6 +1334,11 @@ export async function runAgent(
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
     }
   });
+
+  if (detector) {
+    detectionTimer = setInterval(() => { void evaluateDetection(); }, detectionInterval);
+    detectionTimer.unref?.();
+  }
 
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
@@ -1123,6 +1370,13 @@ export async function runAgent(
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
   } finally {
+    // Stop the detector from evaluating after the run has settled: `settled` is
+    // what `evaluateDetection` bails on, so a timer tick after settle is a no-op.
+    settled = true;
+    if (detectionTimer !== undefined) {
+      clearInterval(detectionTimer);
+      detectionTimer = undefined;
+    }
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
@@ -1142,7 +1396,10 @@ export async function runAgent(
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    // A stuck abort carries its own reason first: the manager copies it to
+    // `record.error`, so a workflow `agent()` sees the stuck message through
+    // the existing `toSpawnResult` path (no new mechanism).
+    failure: stuckAbortReason ?? finalTurnError(session, startLen) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };

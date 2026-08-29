@@ -2505,3 +2505,41 @@ describe("AgentManager — effective model and thinking write-back", () => {
     expect(record.invocation).toEqual({ thinking: "max" });
   });
 });
+
+describe("AgentManager — stuck detection option propagation", () => {
+  let manager: AgentManager;
+
+  afterEach(() => manager?.dispose());
+
+  it("forwards the configured stuck detector options to runAgent", async () => {
+    resolvedRun();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "watch", {
+      description: "watch",
+      isBackground: true,
+      stuckDetection: "rules+ai",
+      stuckRuleIntervalMs: 7,
+      stuckRepeatThreshold: 4,
+      stuckGraceWindows: 2,
+      stuckAiModel: "deepseek-v4-flash",
+      stuckAiIntervalMs: 123,
+    } as any);
+
+    await manager.getRecord(id)!.promise;
+
+    expect(runAgent).toHaveBeenLastCalledWith(
+      mockCtx,
+      "general-purpose",
+      "watch",
+      expect.objectContaining({
+        stuckDetection: "rules+ai",
+        stuckRuleIntervalMs: 7,
+        stuckRepeatThreshold: 4,
+        stuckGraceWindows: 2,
+        stuckAiModel: "deepseek-v4-flash",
+        stuckAiIntervalMs: 123,
+      }),
+    );
+  });
+});

@@ -22,7 +22,8 @@ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import type { StuckDetector } from "./stuck-detector.js";
+import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, StuckDetectionMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
@@ -195,6 +196,14 @@ interface SpawnOptions {
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
   maxTurns?: number;
+  stuckDetection?: StuckDetectionMode;
+  stuckRuleIntervalMs?: number;
+  stuckRepeatThreshold?: number;
+  stuckGraceWindows?: number;
+  stuckAiModel?: string;
+  stuckAiIntervalMs?: number;
+  stuckDetector?: StuckDetector;
+  onStuckState?: (state: "suspicious" | "stuck" | undefined) => void;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -521,6 +530,7 @@ export class AgentManager {
       // since the pool decision needs the finished record.
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
+      stuckState: undefined,
       startedAt: Date.now(),
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
@@ -763,6 +773,17 @@ export class AgentManager {
       agentId: id,
       model: options.model,
       maxTurns: options.maxTurns,
+      stuckDetection: options.stuckDetection,
+      stuckRuleIntervalMs: options.stuckRuleIntervalMs,
+      stuckRepeatThreshold: options.stuckRepeatThreshold,
+      stuckGraceWindows: options.stuckGraceWindows,
+      stuckAiModel: options.stuckAiModel,
+      stuckAiIntervalMs: options.stuckAiIntervalMs,
+      stuckDetector: options.stuckDetector,
+      onStuckState: (state) => {
+        record.stuckState = state;
+        options.onStuckState?.(state);
+      },
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
@@ -854,6 +875,7 @@ export class AgentManager {
           // honest "error" — not a completion with an empty or stale result.
           if (aborted) {
             record.status = "aborted";
+            if (failure) record.error = failure;
           } else if (failure) {
             record.status = "error";
             record.error = failure;

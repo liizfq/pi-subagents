@@ -128,6 +128,7 @@ export type ViewerMarkdownMode = 'off' | 'assistant' | 'all';
  * mode — Claude Code only differs from us on the *new* invocation.
  */
 export type AgentMentionMode = 'model' | 'direct' | 'off';
+export type StuckDetectionMode = "rules" | "rules+ai";
 
 /**
  * What survives a record's eviction so `@handle` keeps working. The live record
@@ -172,6 +173,8 @@ export interface AgentRecord {
   alias?: string;
   description: string;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  /** Latest stuck-detector state while the agent is running. */
+  stuckState?: "suspicious" | "stuck";
   result?: string;
   error?: string;
   toolUses: number;

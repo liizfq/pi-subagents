@@ -50,6 +50,15 @@ const IDLE_STALLED_MS = 10 * 60_000;
 const PHASE_TIMEOUT_MS = 30 * 60_000;
 /** Heartbeat cadence: a periodic liveness signal naming the agent being waited on. */
 const HEARTBEAT_INTERVAL_MS = 60_000;
+/**
+ * How long an in-flight child may sit terminal/missing — its record settled
+ * (or vanished) but the host's spawn promise never returned — before the
+ * watchdog fails that one `agent()` call fatally. The completion-delivery bug
+ * this guards is a manager that settles the record without ever settling the
+ * spawn: the idle clock never fires for it, because the agent is in flight, so
+ * without this the run heartbeats forever.
+ */
+const DELIVERY_GRACE_MS = 30_000;
 
 export class WorkflowRuntimeError extends Error {}
 
@@ -196,10 +205,63 @@ export type WorkflowScriptSource =
   | { ok: true; script: string; path?: string }
   | { ok: false; message: string };
 
+/**
+ * What a host can say about the child behind a runtime agent id, for the
+ * completion-delivery watchdog.
+ *
+ * The runtime hands out its own `wf-agent-N` handles before anything spawns,
+ * because it needs a stable progress-entry identity; the manager issues a
+ * different id when the child actually starts. A probe translates the former
+ * into the latter and reports whether the child is still pending or already
+ * done.
+ */
+export interface WorkflowHostProbe {
+  /**
+   * `pending` while the child's record is queued/running — or not yet
+   * registered at all, which is the startup/queue window and is healthy.
+   * `terminal` once the record settled; `missing` when the mapped record no
+   * longer exists.
+   */
+  state: "pending" | "terminal" | "missing";
+  /** The record's own status, when there is one. */
+  status?: string;
+  /** The manager's record id this runtime id maps to. */
+  recordId?: string;
+}
+
+/**
+ * One in-flight child whose host promise has not settled, tracked so the
+ * watchdog can fail its `agent()` call if the child's record goes
+ * terminal/missing without a result ever arriving.
+ */
+interface PendingDelivery {
+  index: number;
+  label: string;
+  /** Idempotent: settles the delivery race, unblocking the awaiting handleAgent. */
+  fail(): void;
+  /** When the watchdog first saw the child terminal/missing, for the grace clock. */
+  terminalSince?: number;
+  /** The probe snapshot behind a fail, for the diagnostic message. */
+  probe?: WorkflowHostProbe;
+}
+
+/** Sentinel for the delivery race: the watchdog failed the call, the host never delivered. */
+const DELIVERY_FAILED = Symbol("workflow-delivery-failed");
+
 export interface WorkflowHost {
   spawnAgent(request: WorkflowSpawnRequest): Promise<WorkflowSpawnResult>;
   /** Called for every in-flight agent when the run aborts. */
   abortAgent(agentId: string): void;
+  /**
+   * Ask whether the child behind a runtime agent id is still pending/running
+   * or already terminal/missing.
+   *
+   * The completion-delivery watchdog calls this for every in-flight child
+   * whose host promise has not settled. Optional: a host without it simply
+   * never trips the watchdog — the run keeps waiting, exactly as before.
+   * Return undefined if this host cannot say anything about the id.
+   */
+  probeAgent?(agentId: string): WorkflowHostProbe | undefined;
   /**
    * Continue a child that already ran in this run, keeping its context.
    *
@@ -370,6 +432,12 @@ export interface RunWorkflowOptions {
    * a long agent stops looking like a dead run. 0 disables. Defaults to 60s.
    */
   heartbeatIntervalMs?: number;
+  /**
+   * How long an in-flight child may sit terminal/missing — the record settled
+   * but the host's spawn promise never returned — before the watchdog fails
+   * that `agent()` call fatally. Defaults to 30s.
+   */
+  deliveryGraceMs?: number;
 }
 
 export interface WorkflowRunResult {
@@ -691,6 +759,16 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   /** Host clock at launch — the watchdog's idle clock before any agent reports. */
   const runStartedAt = Date.now();
   const inflight = new Set<string>();
+  /**
+   * In-flight children whose host promise has not settled, keyed by runtime
+   * agent id — the completion-delivery watchdog's registry.
+   *
+   * An entry exists only while `handleAgent` is parked on the host's spawn
+   * promise, and is removed when that call settles, so the watchdog can tell a
+   * child that is simply running from one whose record has settled without
+   * ever delivering a result.
+   */
+  const pendingDeliveries = new Map<string, PendingDelivery>();
   /** Label → the child that ran under it, last one wins. The `resume` handle. */
   const completedByLabel = new Map<string, CompletedChild>();
   /**
@@ -865,6 +943,11 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       releasePause();
       for (const agentId of inflight) host.abortAgent(agentId);
       inflight.clear();
+      // Unpark any child whose result never arrived: the run is over, so the
+      // parked handleAgent tasks should unwind (releasing their permits)
+      // rather than stay awaiting a promise that can no longer settle.
+      for (const pending of pendingDeliveries.values()) pending.fail();
+      pendingDeliveries.clear();
       semaphore.drain();
 
       // The last agent still mid-flight when the run stopped, for diagnostics.
@@ -934,8 +1017,37 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     const idleStalledMs = options.idleStalledMs ?? IDLE_STALLED_MS;
     const phaseTimeoutMs = options.phaseTimeoutMs ?? PHASE_TIMEOUT_MS;
     let watchdogState: "idle" | "warned" | "stalled" = "idle";
+    const deliveryGraceMs = options.deliveryGraceMs ?? DELIVERY_GRACE_MS;
     watchdog = setInterval(() => {
       if (settled) return;
+
+      // Completion-delivery watchdog: a child whose record is already terminal
+      // or missing while its host promise never settled is a hang — the child
+      // finished, the result never came back. The idle clock below never fires
+      // for it, because the agent is in flight, so without this the run
+      // heartbeats forever. Give the host a short delivery grace, then fail
+      // exactly that agent() call fatally so the run terminates visibly.
+      if (host.probeAgent !== undefined && pendingDeliveries.size > 0) {
+        const now = Date.now();
+        for (const [agentId, pending] of pendingDeliveries) {
+          const probe = host.probeAgent(agentId);
+          if (probe === undefined || probe.state === "pending") {
+            // Running/queued, or the host cannot say: healthy — never flagged.
+            pending.terminalSince = undefined;
+            continue;
+          }
+          if (pending.terminalSince === undefined) {
+            pending.terminalSince = now;
+            pending.probe = probe;
+            continue;
+          }
+          if (now - pending.terminalSince >= deliveryGraceMs) {
+            pending.probe = probe;
+            pending.fail();
+          }
+        }
+      }
+
       const idleMs =
         waitingAgentLabel(progress) === undefined
           ? Date.now() - lastProgressAt(progress, runStartedAt)
@@ -1225,12 +1337,31 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           live.started = true;
           inflight.add(agentId);
 
+          // The delivery race: the watchdog can unblock THIS exact await when
+          // the child's record goes terminal/missing without the host's promise
+          // ever settling. Whichever side settles first wins; the loser's late
+          // settlement is ignored, and the finally below still runs exactly
+          // once either way. A sentinel, not a rejection, so a fail that lands
+          // after the host already delivered is a no-op rather than an error
+          // with nowhere to go.
+          let deliveryResolve!: (value: typeof DELIVERY_FAILED) => void;
+          const deliveryPromise = new Promise<typeof DELIVERY_FAILED>(resolve => {
+            deliveryResolve = resolve;
+          });
+          const pendingDelivery: PendingDelivery = {
+            index,
+            label,
+            fail() { deliveryResolve(DELIVERY_FAILED); },
+          };
+          pendingDeliveries.set(agentId, pendingDelivery);
+
           let result: WorkflowSpawnResult;
+          let deliveryFailed = false;
           try {
-            result =
+            const raced = await Promise.race<WorkflowSpawnResult | typeof DELIVERY_FAILED>([
               resumed !== undefined && resumeAgent !== undefined
-                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved)
-                : await host.spawnAgent({
+                ? resumeAgent(resumed.agentId, payload.prompt, onResolved)
+                : host.spawnAgent({
                     agentId,
                     index,
                     prompt: payload.prompt,
@@ -1246,41 +1377,88 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     // child's worktree does, and hands back `result.gate`.
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
                     onResolved,
-                  });
-            if (result.ok) {
-              // Recorded before the gate runs: the child itself finished, so it is
-              // resumable even when its gate rejects the work — "here is what the
-              // gate said, fix it" is the loop this exists for.
-              completedByLabel.set(label, {
-                agentId,
-                label,
-                agentType,
-                ...(model !== undefined ? { model } : {}),
-                ...(isolation !== undefined ? { isolation } : {}),
-              });
-              // Re-checked here, not just in the child's tool: this is the one
-              // place that decides the script's value matches the schema it
-              // asked for, so a host that ignored `schema` fails loudly instead
-              // of handing the script prose. Before the gate, because a gate
-              // verifies work and there is no work to verify if the shape is
-              // wrong — and the reader should see the schema error, not a gate
-              // error standing in front of it.
-              if (compiledSchema !== undefined && result.ok) {
-                result = applySchema(result, compiledSchema);
-              }
-              if (result.ok && payload.gate !== undefined && runGate !== undefined) {
-                result = await applyGate(result, payload.gate, agentId, runGate);
+                  }),
+              deliveryPromise,
+            ]);
+            if (raced === DELIVERY_FAILED) {
+              // The watchdog settled this call: the child's record went
+              // terminal/missing and the host never delivered a result.
+              // Handled after the finally, once the bookkeeping is unwound.
+              deliveryFailed = true;
+              // Never read — the delivery path returns before `result` is
+              // touched — but present so the type is definite either way.
+              result = { ok: false, error: "" };
+            } else {
+              result = raced;
+              if (result.ok) {
+                // Recorded before the gate runs: the child itself finished, so it is
+                // resumable even when its gate rejects the work — "here is what the
+                // gate said, fix it" is the loop this exists for.
+                completedByLabel.set(label, {
+                  agentId,
+                  label,
+                  agentType,
+                  ...(model !== undefined ? { model } : {}),
+                  ...(isolation !== undefined ? { isolation } : {}),
+                });
+                // Re-checked here, not just in the child's tool: this is the one
+                // place that decides the script's value matches the schema it
+                // asked for, so a host that ignored `schema` fails loudly instead
+                // of handing the script prose. Before the gate, because a gate
+                // verifies work and there is no work to verify if the shape is
+                // wrong — and the reader should see the schema error, not a gate
+                // error standing in front of it.
+                if (compiledSchema !== undefined && result.ok) {
+                  result = applySchema(result, compiledSchema);
+                }
+                if (result.ok && payload.gate !== undefined && runGate !== undefined) {
+                  result = await applyGate(result, payload.gate, agentId, runGate);
+                }
               }
             }
           } catch (error) {
             result = { ok: false, error: error instanceof Error ? error.message : String(error) };
           } finally {
+            pendingDeliveries.delete(agentId);
             inflight.delete(agentId);
             live.started = false;
             semaphore.release();
           }
 
           if (settled) return;
+
+          // The completion-delivery watchdog failed this call: the child's
+          // record settled (or vanished) without the host ever returning a
+          // result. Fatal, not null — the run must terminate visibly rather
+          // than continue with a hole where a result belongs.
+          if (deliveryFailed) {
+            const probe = pendingDelivery.probe;
+            const what =
+              probe?.state === "missing"
+                ? "its record was cleaned up"
+                : `it reached "${probe?.status ?? "terminal"}"`;
+            const error =
+              `Agent "${label}" ${what} but its result was never delivered; the agent() call was failed ` +
+              `after ${Math.round(deliveryGraceMs / 1000)}s.` +
+              (probe?.recordId !== undefined ? ` Record: ${probe.recordId}.` : "");
+            recordJournal?.({ index, key, ok: false, ...resumeMark });
+            emit([
+              {
+                ...base,
+                queuedAt,
+                startedAt,
+                ...attemptMark,
+                lastProgressAt: Date.now(),
+                state: "error",
+                error,
+              },
+            ]);
+            // A log line too: the row shows the failed agent, the log says why
+            // the whole run is about to stop.
+            emit([{ type: "workflow_log", message: `Delivery failure: ${error}` }]);
+            respond(callId, false, undefined, error, true);
+            return;
+          }
 
           // The stop that produced this result was ours, so run the same call
           // again rather than reporting it. The script is still awaiting this

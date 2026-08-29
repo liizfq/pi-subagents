@@ -97,6 +97,21 @@ function succeeded(record: AgentRecord | undefined): boolean {
   return record?.status === "completed" || record?.status === "steered";
 }
 
+/**
+ * Record statuses that mean the child is done, one way or another.
+ *
+ * The completion-delivery probe treats these as terminal: the child settled,
+ * so a host promise that never returned a result is a delivery hang rather
+ * than a still-working child. The rest (`queued`, `running`) are pending.
+ */
+const TERMINAL_STATUSES: ReadonlySet<AgentRecord["status"]> = new Set([
+  "completed",
+  "steered",
+  "aborted",
+  "stopped",
+  "error",
+]);
+
 /** Translate a settled record into what the script sees. */
 /**
  * The effective-configuration half of a record, in the runtime's pi-free shape.
@@ -359,6 +374,22 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // Nothing to abort before the manager has issued an id — the child is
       // still in startup, and the run's own signal reaches it there.
       if (id !== undefined) manager.abort(id);
+    },
+
+    probeAgent(agentId) {
+      const id = records.get(agentId);
+      // No record id yet: the child is still queued or starting up. It cannot
+      // have settled, so the watchdog must not flag it.
+      if (id === undefined) return { state: "pending" };
+      const record = manager.getRecord(id);
+      // Mapped but the record is gone — cleaned up or evicted mid-run — so the
+      // child can no longer deliver a result.
+      if (record === undefined) return { state: "missing", recordId: id };
+      return {
+        state: TERMINAL_STATUSES.has(record.status) ? "terminal" : "pending",
+        status: record.status,
+        recordId: id,
+      };
     },
 
     async resumeAgent(agentId, prompt, onResolved) {

@@ -902,6 +902,23 @@ describe("watchdog", () => {
     }
   });
 
+  it("fails visibly when a terminal child never delivers its result", async () => {
+    const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+    host.probeAgent = () => ({ state: "terminal", status: "completed", recordId: "child-1" });
+
+    const result = await run('await agent("lost result");\nreturn 1;', {
+      host,
+      watchdogIntervalMs: 10,
+      deliveryGraceMs: 20,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(String(result.error)).toContain('Agent "lost result"');
+    expect(String(result.error)).toContain("result was never delivered");
+    const entry = agentEntries(result.progress).filter(candidate => candidate.label === "lost result").at(-1);
+    expect(entry?.state).toBe("error");
+  });
+
   it("does not flag a run whose in-flight agent is quiet but alive", async () => {
     // An agent that never settles IS the run being busy: the runtime cannot
     // tell "deep analysis, no progress events" from "hung", so an in-flight
@@ -909,6 +926,7 @@ describe("watchdog", () => {
     // real work — this was reported as a false positive).
     const controller = new AbortController();
     const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+    host.probeAgent = () => ({ state: "pending", status: "running", recordId: "child-1" });
 
     const statuses: string[] = [];
     const stalled: number[] = [];

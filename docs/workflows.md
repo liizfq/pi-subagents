@@ -89,6 +89,8 @@ How a script converges is up to it, but the shape that works is the same every t
 
 A run that goes quiet for a long stretch is watched rather than silently hung: **only when no agent is in flight** — a run with an agent still working is never flagged, since the runtime cannot tell a deeply-analysing agent from a hung one. With nothing running, idle for three minutes emits an idle warning, for ten it is flagged **stalled** (a warning, not a completion — the run keeps going and stays reachable from the inspector), and with thirty minutes of no agent activity it is stopped as timed out. These are defaults, not promises — they are tunable in the runtime, not in the tool call.
 
+A second completion-delivery check covers a narrower failure: when a child record has already reached a terminal state (or vanished) but the host has not returned its result to the workflow's pending `agent()` call. After a 30-second delivery grace (`deliveryGraceMs` in the runtime), that call fails fatally with the child label and record id instead of leaving the workflow heartbeating forever. A child still queued or running is exempt.
+
 While a run is waiting on a particular agent, it also beats a **heartbeat**: every minute the card and inspector name the in-flight agent (`waiting on audit:auth`), so a long agent reads as still working rather than dead. The heartbeat is liveness, the watchdog is judgement — one says what the run is waiting on, the other decides when waiting has gone on too long.
 
 The fifth key only shows you something:
@@ -404,6 +406,9 @@ The file is not in any of the three directories, or it is there but carries no `
 
 **The run seems stuck with agents queued.**
 Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slots free. A pause (`p`) also holds new starts while letting running agents finish.
+
+**A child agent got stuck and its `agent()` call failed.**
+Stuck detection (the extension's `stuckDetection` setting, default `rules`) watches each subagent's activity window. Repeated identical tool calls (same tool + same args), a wall of consecutive failures, no output, or no activity at all mark the run `suspicious`; after `stuckGraceWindows` consecutive suspicious windows (default 3 ≈ 90s of a 30s cadence) the run is steered to wrap up and then aborted through the same path as a max-turns abort. The settled record keeps `status: "aborted"`, and the workflow sees the failure through the existing `toSpawnResult` path — `agent()` resolves to `null` (with a catchable error on the host side), so a well-written script's `runPhase` try/catch records the failure and the run continues or fails cleanly. In `rules+ai` mode an AI reviewer (default `deepseek-v4-flash`, 10-minute per-agent cooldown, 15s timeout) can clear a sustained-suspicious run (verdict `stuck: false` resets the detector to healthy) or confirm it (`stuck: true` aborts immediately).
 
 ## What workflows can't do
 
