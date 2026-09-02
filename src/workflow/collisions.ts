@@ -118,3 +118,29 @@ export function decideWorkflowCollision(input: {
     withdraw: !tookOurName,
   };
 }
+
+/**
+ * Decide whether another extension has taken our `Agent` tool name.
+ *
+ * When a foreign extension registers a tool named `Agent` first, pi keeps
+ * the foreign one and silently drops ours. `stop_subagent` becomes orphaned
+ * (you can't stop an agent you can't spawn), so it must be withdrawn too.
+ */
+export function decideAgentCollision(input: {
+  tools: readonly RegisteredToolInfo[];
+  ownDescription: string;
+}): { kind: "none" | "standDown"; message?: string; withdraw: boolean } {
+  const foreign = input.tools.find(
+    tool => tool.name === SUBAGENT_TOOL_NAMES.AGENT && tool.description !== input.ownDescription,
+  );
+  if (!foreign) return { kind: "none", withdraw: false };
+  const source = foreign.sourceInfo?.source ?? "unknown source";
+  return {
+    kind: "standDown",
+    message:
+      `Another extension (${source}) already registers an "${SUBAGENT_TOOL_NAMES.AGENT}" tool. ` +
+      "Pi keeps the first registration, so this extension's Agent tool is not offered to the model. " +
+      "stop_subagent is withdrawn too.",
+    withdraw: true,
+  };
+}

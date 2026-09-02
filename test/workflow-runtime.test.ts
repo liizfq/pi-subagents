@@ -681,6 +681,7 @@ describe("abort", () => {
     const promise = run('await agent("start");\nfor (;;) {}', {
       host,
       signal: controller.signal,
+      abortGraceMs: 100,
       onProgress(entries) {
         if (entries.some(e => e.type === "workflow_agent" && e.state === "done")) spinning();
       },
@@ -706,6 +707,40 @@ describe("abort", () => {
     const result = await run('await agent("never");', { host, signal: AbortSignal.abort() });
     expect(result.status).toBe("killed");
     expect(calls).toHaveLength(0);
+  });
+
+  it("stops a paused run without getting stuck at the pause gate", async () => {
+    // A second agent() issued while paused parks at the pause gate; an abort
+    // must release that hold, not leave the run wedged there.
+    const controller = new AbortController();
+    const { host } = stubHost(request =>
+      request.prompt === "second"
+        ? new Promise<WorkflowSpawnResult>(() => {})
+        : { ok: true, text: "ok:first" },
+    );
+    let controlRef: WorkflowControl | undefined;
+    let paused = false;
+    const promise = run(
+      'await agent("first");\nawait agent("second");\nreturn "done";',
+      {
+        host,
+        signal: controller.signal,
+        abortGraceMs: 200,
+        onControl: c => { controlRef = c; },
+        onProgress(entries) {
+          if (controlRef && !paused && entries.some(e => e.type === "workflow_agent" && e.index === 0 && e.startedAt != null)) {
+            paused = true;
+            controlRef.pause();
+          }
+        },
+      },
+    );
+    for (let i = 0; i < 400 && !paused; i++) await sleep(5);
+    expect(paused, "the run must actually be paused before the stop").toBe(true);
+    controller.abort();
+    const result = await Promise.race([promise, sleep(3000).then(() => undefined)]);
+    expect(result, "the parked agent must be released by the abort").toBeDefined();
+    expect(result!.status).toBe("killed");
   });
 });
 
@@ -752,6 +787,51 @@ describe("abort terminal state", () => {
     expect(persisted).toHaveLength(1);
     expect(persisted[0].status).toBe("killed");
     expect(persisted[0].agentCount).toBe(1);
+  });
+
+  it("isolates an onTerminal error from persistence and settlement", async () => {
+    const { host } = stubHost();
+    const persisted: WorkflowRunSummary[] = [];
+    const promise = run('return "done";', {
+      host,
+      onTerminal: () => { throw new Error("notification failed"); },
+      persistRunSummary: summary => { persisted.push(summary); },
+    });
+
+    const result = await Promise.race([promise, sleep(500).then(() => undefined)]);
+    expect(result).toBeDefined();
+    expect(result?.status).toBe("completed");
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].status).toBe("completed");
+  });
+
+  it("isolates a persistence error from notification and settlement", async () => {
+    const { host } = stubHost();
+    const terminals: WorkflowRunSummary[] = [];
+    const promise = run('return "done";', {
+      host,
+      onTerminal: summary => { terminals.push(summary); },
+      persistRunSummary: () => { throw new Error("persistence failed"); },
+    });
+
+    const result = await Promise.race([promise, sleep(500).then(() => undefined)]);
+    expect(result).toBeDefined();
+    expect(result?.status).toBe("completed");
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0].status).toBe("completed");
+  });
+
+  it("still resolves and terminates when both terminal hooks throw", async () => {
+    const { host } = stubHost();
+    const promise = run('return "done";', {
+      host,
+      onTerminal: () => { throw new Error("notification failed"); },
+      persistRunSummary: () => { throw new Error("persistence failed"); },
+    });
+
+    const result = await Promise.race([promise, sleep(500).then(() => undefined)]);
+    expect(result).toBeDefined();
+    expect(result?.status).toBe("completed");
   });
 
   it("fires onTerminal for a completed run too", async () => {
@@ -823,6 +903,39 @@ describe("abort terminal state", () => {
     expect(caught).toBeDefined();
   });
 
+  it("does not terminate at the 100ms ACK deadline when grace is longer", async () => {
+    const controller = new AbortController();
+    const { host } = hangingHost();
+    const progress: WorkflowEntry[] = [];
+    let started = () => {};
+    const promise = run(
+      [
+        "try {",
+        "  await agent('hang');",
+        "} finally {",
+        "  await new Promise(resolve => setTimeout(resolve, 180));",
+        "  log('finally completed');",
+        "}",
+      ].join("\n"),
+      {
+        host,
+        signal: controller.signal,
+        abortGraceMs: 300,
+        onProgress(entries) {
+          progress.push(...entries);
+          if (entries.some(e => e.type === "workflow_agent" && e.startedAt != null)) started();
+        },
+      },
+    );
+
+    await started;
+    controller.abort();
+    const result = await promise;
+
+    expect(result.status).toBe("killed");
+    expect(progress.some(e => e.type === "workflow_log" && e.message === "finally completed")).toBe(true);
+  });
+
   it("keeps the run killed even when the script converges inside the grace window", async () => {
     // An abort is not a completion: whatever the script's finally does in the
     // grace window, the run must still settle as killed.
@@ -861,6 +974,32 @@ describe("abort terminal state", () => {
 });
 
 describe("watchdog", () => {
+  it("forwards a stuck callback once and ignores suspicious state", async () => {
+    const controller = new AbortController();
+    const states: Array<"suspicious" | "stuck" | undefined> = [];
+    const { host } = stubHost(request => {
+      request.onStuckState?.("suspicious");
+      request.onStuckState?.("stuck");
+      request.onStuckState?.("stuck");
+      return new Promise<WorkflowSpawnResult>(() => {});
+    });
+    const promise = run('await agent("diagnose");', {
+      host,
+      signal: controller.signal,
+      onProgress(entries) {
+        for (const entry of entries) {
+          if (entry.type === "run_status" && entry.state === "agent_stuck") states.push("stuck");
+        }
+      },
+    });
+    // Deterministic sync point: wait until the runtime has actually emitted the
+    // agent_stuck run_status, so a busy machine cannot starve the callback.
+    for (let i = 0; i < 400 && states.length === 0; i++) await sleep(5);
+    controller.abort();
+    await promise;
+    expect(states).toEqual(["stuck"]);
+  });
+
   it("warns, then stalls, then kills a run whose script is wedged with no agent in flight", async () => {
     // An agent that completes, then a script await that never resolves: no
     // agent is in flight, so the idle clock runs and the watchdog fires.
@@ -917,6 +1056,85 @@ describe("watchdog", () => {
     expect(String(result.error)).toContain("result was never delivered");
     const entry = agentEntries(result.progress).filter(candidate => candidate.label === "lost result").at(-1);
     expect(entry?.state).toBe("error");
+  });
+
+  it("does not flag a suspicious in-flight agent as an ordinary workflow stall", async () => {
+    const controller = new AbortController();
+    const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+    host.probeAgent = () => ({
+      state: "pending",
+      status: "running",
+      stuckState: "suspicious",
+      recordId: "child-1",
+    });
+
+    const statuses: string[] = [];
+    let started = () => {};
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const promise = run('await agent("suspicious analysis");', {
+      host,
+      signal: controller.signal,
+      watchdogIntervalMs: 20,
+      idleWarnMs: 30,
+      idleStalledMs: 60,
+      phaseTimeoutMs: 90,
+      onProgress(entries) {
+        if (entries.some(e => e.type === "workflow_agent" && e.startedAt != null)) started();
+        for (const entry of entries) {
+          if (entry.type === "run_status") statuses.push(entry.state);
+        }
+      },
+    });
+
+    try {
+      await running;
+      await sleep(150);
+      expect(statuses).not.toContain("idle_warning");
+      expect(statuses).not.toContain("stalled");
+    } finally {
+      controller.abort();
+      expect((await promise).status).toBe("killed");
+    }
+  });
+
+  it("reports a stuck in-flight agent without treating the workflow as stalled", async () => {
+    const controller = new AbortController();
+    const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+    host.probeAgent = () => ({
+      state: "pending",
+      status: "running",
+      stuckState: "stuck",
+      recordId: "child-1",
+    });
+
+    const statuses: string[] = [];
+    let started = () => {};
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const promise = run('await agent("stuck analysis");', {
+      host,
+      signal: controller.signal,
+      watchdogIntervalMs: 20,
+      idleWarnMs: 30,
+      idleStalledMs: 60,
+      phaseTimeoutMs: 90,
+      onProgress(entries) {
+        if (entries.some(e => e.type === "workflow_agent" && e.startedAt != null)) started();
+        for (const entry of entries) {
+          if (entry.type === "run_status") statuses.push(entry.state);
+        }
+      },
+    });
+
+    try {
+      await running;
+      await sleep(80);
+      expect(statuses).toContain("agent_stuck");
+      expect(statuses).not.toContain("stalled");
+      expect(statuses).not.toContain("idle_warning");
+    } finally {
+      controller.abort();
+      expect((await promise).status).toBe("killed");
+    }
   });
 
   it("does not flag a run whose in-flight agent is quiet but alive", async () => {

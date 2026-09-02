@@ -312,7 +312,14 @@ interface SpawnOptions {
   rootSessionId?: string;
 }
 
-interface ResumeOptions {
+export interface ResumeOptions {
+  stuckDetection?: StuckDetectionMode;
+  stuckRuleIntervalMs?: number;
+  stuckRepeatThreshold?: number;
+  stuckGraceWindows?: number;
+  stuckAiModel?: string;
+  stuckAiIntervalMs?: number;
+  stuckDetector?: StuckDetector;
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -327,6 +334,8 @@ interface ResumeOptions {
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
+  /** Called when the resumed session's stuck detector changes state. */
+  onStuckState?: (state: "suspicious" | "stuck" | undefined) => void;
   /**
    * Background resume only: called synchronously when the run actually starts —
    * immediately, or later from drainQueue. Callers wire per-run side effects
@@ -378,6 +387,7 @@ export class AgentManager {
   private onUsage?: OnAgentUsage;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
+  private modelRegistries = new Map<string, ExtensionContext["modelRegistry"]>();
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
@@ -508,6 +518,7 @@ export class AgentManager {
     assertValidSpawnCwd(options.cwd);
 
     const id = randomUUID().slice(0, 17);
+    this.modelRegistries.set(id, ctx.modelRegistry);
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -642,9 +653,11 @@ export class AgentManager {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
           record.completedAt = Date.now();
+          this.modelRegistries.delete(id);
           this.onComplete?.(record);
         } else {
           this.agents.delete(id);
+          this.modelRegistries.delete(id);
         }
         // The agent never kept its slot (startAgent gives it back on failure),
         // so anything queued behind it can go now.
@@ -1177,6 +1190,7 @@ export class AgentManager {
               record.status = "error";
               record.error = err instanceof Error ? err.message : String(err);
               record.completedAt = Date.now();
+              this.modelRegistries.delete(id);
               this.onComplete?.(record);
             }
           },
@@ -1196,7 +1210,16 @@ export class AgentManager {
     record.error = undefined;
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const modelRegistry = this.modelRegistries.get(id);
+      const { text, failure, aborted } = await resumeAgent(record.session, prompt, {
+        stuckDetection: options?.stuckDetection,
+        stuckRuleIntervalMs: options?.stuckRuleIntervalMs,
+        stuckRepeatThreshold: options?.stuckRepeatThreshold,
+        stuckGraceWindows: options?.stuckGraceWindows,
+        stuckAiModel: options?.stuckAiModel,
+        stuckAiIntervalMs: options?.stuckAiIntervalMs,
+        stuckDetector: options?.stuckDetector,
+        modelRegistry,
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
@@ -1211,11 +1234,15 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
+        onStuckState: (state) => {
+          record.stuckState = state;
+          options?.onStuckState?.(state);
+        },
         signal,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
+      record.status = aborted ? "aborted" : failure ? "error" : "completed";
       if (failure) record.error = failure;
       record.result = text;
       record.completedAt = Date.now();
@@ -1287,7 +1314,16 @@ export class AgentManager {
       this.drainQueue();
     };
 
+    const modelRegistry = this.modelRegistries.get(id);
     const promise = resumeAgent(record.session, prompt, {
+      stuckDetection: options.stuckDetection,
+      stuckRuleIntervalMs: options.stuckRuleIntervalMs,
+      stuckRepeatThreshold: options.stuckRepeatThreshold,
+      stuckGraceWindows: options.stuckGraceWindows,
+      stuckAiModel: options.stuckAiModel,
+      stuckAiIntervalMs: options.stuckAiIntervalMs,
+      stuckDetector: options.stuckDetector,
+      modelRegistry,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
@@ -1302,14 +1338,18 @@ export class AgentManager {
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
       },
+      onStuckState: (state) => {
+        record.stuckState = state;
+        options.onStuckState?.(state);
+      },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, failure, aborted }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
-          // Same contract as the spawn path (#144): a failed final turn is an
-          // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
+          // A stuck detector hard-abort is an aborted outcome, while an ordinary
+          // provider failure remains an error; the resumed text stays available.
+          record.status = aborted ? "aborted" : failure ? "error" : "completed";
           if (failure) record.error = failure;
         }
         record.result = text;
@@ -1437,6 +1477,7 @@ export class AgentManager {
       this.dequeue(q => q.id === id);
       record.status = "stopped";
       record.completedAt = Date.now();
+      this.modelRegistries.delete(id);
       return true;
     }
 
@@ -1458,6 +1499,7 @@ export class AgentManager {
     // A failed startup keeps its (rejected) entry so a late awaitStartup still
     // sees it; drop it with the record so the map can't grow unbounded.
     this.startups.delete(id);
+    this.modelRegistries.delete(id);
     // Fire-and-forget is right here and only here: this runs from the 60s cleanup timer
     // and from `clearCompleted()` on session boundaries, with the process staying alive,
     // so handlers get their full window. The quit path awaits instead — see dispose().
@@ -1584,6 +1626,7 @@ export class AgentManager {
     const sessions = [...this.agents.values()].map(record => record.session);
     this.agents.clear();
     this.startups.clear();
+    this.modelRegistries.clear();
     if (pi) {
       // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
       // on the shutdown path, which cannot wait for git. Started before the awaited

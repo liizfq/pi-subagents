@@ -152,6 +152,6 @@ describe("rendering", () => {
     // A bare `${...}` in the .ts literal would interpolate at module load and
     // reach the model as a value (or throw), not as the example text.
     expect(description).not.toContain("[object Object]");
-    expect(description).toContain("${f.title}");
+    expect(description).toContain("${" + "f.title}");
   });
 });

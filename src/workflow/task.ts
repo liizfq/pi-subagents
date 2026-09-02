@@ -18,7 +18,7 @@ import { randomUUID } from "node:crypto";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
-import { collapse, elapsedMs, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
+import { collapse, elapsedMs, stats, type WorkflowAgentEntry, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
@@ -59,6 +59,8 @@ export interface WorkflowTask {
   resumedFrom?: string;
   /** How many agents came back from {@link replay} instead of being spawned. */
   replayedCount: number;
+  /** The last agent still mid-flight when the run stopped, for terminal diagnostics. */
+  lastAgent?: { index: number; label: string; state: WorkflowAgentEntry["state"] };
 
   /** The append-only event log, in emission order. */
   workflowProgress: WorkflowEntry[];
@@ -187,6 +189,21 @@ export function resumeWorkflowTask(task: WorkflowTask, now = Date.now()): boolea
   return true;
 }
 
+export type WorkflowStopResult =
+  | { kind: "requested" }
+  | { kind: "already-stopping" }
+  | { kind: "settled"; status: WorkflowRunStatus };
+
+/** Request a running or paused workflow to stop; runtime owns convergence. */
+export function requestStopWorkflowTask(task: WorkflowTask): WorkflowStopResult {
+  if (task.status !== "running" && task.status !== "paused") {
+    return { kind: "settled", status: task.status };
+  }
+  if (task.abortController.signal.aborted) return { kind: "already-stopping" };
+  task.abortController.abort();
+  return { kind: "requested" };
+}
+
 /** Settle a task from the run's own result. */
 export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResult): void {
   // Banked before the status moves off "paused": a run that finished while held
@@ -203,6 +220,7 @@ export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResu
   task.workflowName ??= result.meta.name;
   task.agentCount = Math.max(task.agentCount, result.agentCount);
   task.replayedCount = result.replayedCount;
+  task.lastAgent = result.lastAgent;
   task.value = result.value;
   task.error = result.error;
   task.endTime = Date.now();
@@ -297,6 +315,11 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     }</summary>`,
     `<result>${escapeXml(result.length > 4000 ? `${result.slice(0, 4000)}\n...(truncated)` : result)}</result>`,
     `<usage><total_tokens>${task.totalTokens}</total_tokens><tool_uses>${task.totalToolCalls}</tool_uses><duration_ms>${elapsedMs(task, now)}</duration_ms></usage>`,
+    // Terminal diagnostics only: a completed run has no last un-converged agent
+    // to name, so the line is omitted on the happy path.
+    task.status !== "completed" && task.lastAgent !== undefined
+      ? `<last-agent>${escapeXml(task.lastAgent.label)}</last-agent>`
+      : null,
     `</task-notification>`,
   ].filter(Boolean).join("\n");
 }

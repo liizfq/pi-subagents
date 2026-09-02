@@ -100,6 +100,8 @@ Three things the table cannot show:
 
 `isTopLevelAgent(record)` is `parentAgentId === undefined && workflowId === undefined` (`src/agent-manager.ts:122-126`). `subagents:rpc:stop` enforces it (`src/cross-extension-rpc.ts:178`): a nested child or a workflow's agent is owned by something that is *waiting on it*, and aborting it out from under that owner turns another extension's stop into a failed step. It is defence in depth rather than a live hole — no RPC hands out agent ids, so a caller has no ordinary way to name one it does not own.
 
+The model-layer equivalent is the `stop_subagent` tool (registered in `src/index.ts`). It mirrors the RPC stop handler's logic: look up the record, check ownership, abort if running or queued, and return an idempotent message if already settled. The tool takes an `id` (the agent id returned by the `Agent` tool) and calls `manager.abort(id)`. It is the LLM-callable counterpart to `subagents:rpc:stop`, which serves the same purpose for programmatic cross-extension callers.
+
 Two asymmetries to know about, stated as they are:
 
 - **Stop takes an id only** (`src/index.ts:806`). Consume takes an id *or* an `@handle`, through `resolveAgentRef` (`src/index.ts:816` → `:731-736`).

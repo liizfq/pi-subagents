@@ -42,8 +42,10 @@ import type { CompiledSchema } from "./workflow/json-schema.js";
 export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
   WORKFLOW: "SubagentWorkflow",
+  STOP_WORKFLOW: "StopSubagentWorkflow",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  STOP_SUBAGENT: "stop_subagent",
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
@@ -360,7 +362,7 @@ export function getGraceTurns(): number { return graceTurns; }
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
 /** Default rule-evaluation period for stuck detection. */
-const DEFAULT_STUCK_RULE_INTERVAL_MS = 30_000;
+const DEFAULT_STUCK_RULE_INTERVAL_MS = 60_000;
 /** Default number of identical calls needed to flag a window. */
 const DEFAULT_STUCK_REPEAT_THRESHOLD = 5;
 /** Default number of suspicious windows before a rules-only abort. */
@@ -650,6 +652,63 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
  * Wire an AbortSignal to abort a session.
  * Returns a cleanup function to remove the listener.
  */
+function parseStuckVerdict(response: { content: unknown }): boolean | undefined {
+  const text = Array.isArray(response.content)
+    ? response.content
+      .filter((part): part is { type: "text"; text: string } =>
+        typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string")
+      .map(part => part.text)
+      .join("\n")
+    : "";
+  const jsonText = text.match(/\{[\s\S]*\}/)?.[0];
+  if (!jsonText) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(jsonText);
+    return typeof parsed === "object" && parsed !== null && typeof (parsed as { stuck?: unknown }).stuck === "boolean"
+      ? (parsed as { stuck: boolean }).stuck
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function reviewStuckWithAi(
+  registry: ExtensionContext["modelRegistry"],
+  modelInput: string,
+  activitySummary: string,
+): Promise<boolean | undefined> {
+  let resolved: Model<any> | string;
+  try {
+    resolved = resolveModel(modelInput, registry);
+  } catch {
+    return undefined;
+  }
+  if (typeof resolved === "string") return undefined;
+  try {
+    const userMessage: UserMessage = {
+      role: "user",
+      content: [{
+        type: "text",
+        text: "Determine whether this subagent is genuinely stuck. Reply with JSON only: {\"stuck\":true} or {\"stuck\":false}. " +
+          "Tool arguments are intentionally omitted; judge only the activity pattern.\n\n" + activitySummary,
+      }],
+      timestamp: Date.now(),
+    };
+    const response = await registry.complete(
+      resolved,
+      {
+        systemPrompt: "You are a conservative subagent liveness reviewer. Do not infer secrets or request tool arguments.",
+        messages: [userMessage],
+      },
+      { signal: AbortSignal.timeout(15_000) },
+    );
+    return parseStuckVerdict(response);
+  } catch {
+    return undefined;
+  }
+}
+
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
   const onAbort = () => session.abort();
@@ -1124,6 +1183,12 @@ export async function runAgent(
   let stuckAbortPending = false;
   let settled = false;
   let detectionTimer: ReturnType<typeof setInterval> | undefined;
+  let reportedState: "suspicious" | "stuck" | undefined;
+  const reportState = (state: "suspicious" | "stuck" | undefined): void => {
+    if (reportedState === state) return;
+    reportedState = state;
+    options.onStuckState?.(state);
+  };
 
   const rememberActivity = (sample: typeof activity[number]) => {
     activity.push(sample);
@@ -1145,28 +1210,6 @@ export async function runAgent(
     return lines.join("\n").slice(-4_000) || "No recent activity.";
   };
 
-  const parseStuckVerdict = (response: { content: unknown }): boolean | undefined => {
-    const text = Array.isArray(response.content)
-      ? response.content
-        .filter((part): part is { type: "text"; text: string } =>
-          typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" &&
-          typeof (part as { text?: unknown }).text === "string")
-        .map(part => part.text)
-        .join("\n")
-      : "";
-    const jsonText = text.match(/\{[\s\S]*\}/)?.[0];
-    if (!jsonText) return undefined;
-    try {
-      const parsed: unknown = JSON.parse(jsonText);
-      if (typeof parsed === "object" && parsed !== null && typeof (parsed as { stuck?: unknown }).stuck === "boolean") {
-        return (parsed as { stuck: boolean }).stuck;
-      }
-    } catch {
-      return undefined;
-    }
-    return undefined;
-  };
-
   const requestSteer = (message: string): void => {
     try {
       void Promise.resolve(session.steer(message)).catch(() => {});
@@ -1179,45 +1222,14 @@ export async function runAgent(
     if (detectionMode !== "rules+ai" || aiReviewInFlight || Date.now() - lastAiReviewAt < aiInterval) {
       return undefined;
     }
-    const modelInput = options.stuckAiModel ?? stuckAiModel;
-    let resolved: Model<any> | string;
-    try {
-      resolved = resolveModel(modelInput, ctx.modelRegistry);
-    } catch {
-      return undefined;
-    }
-    if (typeof resolved === "string") return undefined;
     aiReviewInFlight = true;
     lastAiReviewAt = Date.now();
-    // Fail-safe: race complete() against a 15s timeout so the reviewer
-    // resolves deterministically even if the provider ignores AbortSignal.
-    const timeout = new Promise<never>((_resolve, reject) =>
-      setTimeout(() => reject(new Error("stuck AI review timed out after 15s")), 15_000));
     try {
-      const userMessage: UserMessage = {
-        role: "user",
-        content: [{
-          type: "text",
-          text: "Determine whether this subagent is genuinely stuck. Reply with JSON only: {\"stuck\":true} or {\"stuck\":false}. " +
-            "Tool arguments are intentionally omitted; judge only the activity pattern.\n\n" + activitySummary(),
-        }],
-        timestamp: Date.now(),
-      };
-      const response = await Promise.race([
-        ctx.modelRegistry.complete(
-          resolved,
-          {
-            systemPrompt: "You are a conservative subagent liveness reviewer. Do not infer secrets or request tool arguments.",
-            messages: [userMessage],
-          },
-          { signal: AbortSignal.timeout(15_000) },
-        ),
-        timeout,
-      ]);
-      return parseStuckVerdict(response);
-    } catch {
-      // Timeout or provider error: fail-safe — the run stays suspicious, never aborts.
-      return undefined;
+      return await reviewStuckWithAi(
+        ctx.modelRegistry,
+        options.stuckAiModel ?? stuckAiModel,
+        activitySummary(),
+      );
     } finally {
       aiReviewInFlight = false;
     }
@@ -1227,7 +1239,7 @@ export async function runAgent(
     if (aborted || settled || stuckAbortReason !== undefined) return;
     if (!stuckAbortPending) {
       stuckAbortPending = true;
-      options.onStuckState?.("stuck");
+      reportState("stuck");
       if (!stuckSteerSent) {
         stuckSteerSent = true;
         requestSteer("The agent appears stuck. Wrap up immediately — provide your final answer now.");
@@ -1245,7 +1257,7 @@ export async function runAgent(
     stuckAbortPending = false;
     stuckSteerSent = false;
     detector.reset(Date.now());
-    options.onStuckState?.(undefined);
+    reportState(undefined);
   };
 
   const evaluateDetection = async () => {
@@ -1253,10 +1265,10 @@ export async function runAgent(
     const evaluation = detector.evaluate(Date.now());
     if (evaluation.status === "healthy") {
       cancelPendingStuckAbort();
-      options.onStuckState?.(undefined);
+      reportState(undefined);
       return;
     }
-    options.onStuckState?.(evaluation.status === "stuck" ? "stuck" : "suspicious");
+    reportState(evaluation.status === "stuck" ? "stuck" : "suspicious");
     if (stuckAbortPending) {
       // The steer was sent; only a subsequent still-stuck evaluation may hard
       // abort. A merely suspicious result gets another window to recover.
@@ -1267,7 +1279,7 @@ export async function runAgent(
       const verdict = await reviewWithAi();
       if (verdict === false) {
         detector.reset(Date.now());
-        options.onStuckState?.(undefined);
+        reportState(undefined);
         return;
       }
       if (verdict === true) {
@@ -1415,47 +1427,135 @@ export async function resumeAgent(
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+    stuckDetection?: StuckDetectionMode;
+    stuckRuleIntervalMs?: number;
+    stuckRepeatThreshold?: number;
+    stuckGraceWindows?: number;
+    stuckAiModel?: string;
+    stuckAiIntervalMs?: number;
+    stuckDetector?: StuckDetector;
+    modelRegistry?: ExtensionContext["modelRegistry"];
+    onStuckState?: (state: "suspicious" | "stuck" | undefined) => void;
     signal?: AbortSignal;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; aborted: boolean; failure?: string }> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  const detectionMode = options.stuckDetection ?? stuckDetection;
+  const detectionInterval = Math.max(1, Math.floor(options.stuckRuleIntervalMs ?? stuckRuleIntervalMs));
+  const aiInterval = Math.max(1, Math.floor(options.stuckAiIntervalMs ?? stuckAiIntervalMs));
+  const detector = options.stuckDetector ?? createStuckDetector({
+    windowMs: detectionInterval,
+    repeatThreshold: Math.max(1, Math.floor(options.stuckRepeatThreshold ?? stuckRepeatThreshold)),
+    graceWindows: Math.max(1, Math.floor(options.stuckGraceWindows ?? stuckGraceWindows)),
+    initialAt: Date.now(),
+  });
+  const modelRegistry = options.modelRegistry;
+  let aborted = options.signal?.aborted === true;
+  let settled = false;
+  let stuckAbortReason: string | undefined;
+  let stuckAbortPending = false;
+  let stuckSteerSent = false;
+  let detectionTimer: ReturnType<typeof setInterval> | undefined;
+  let lastAiReviewAt = -Infinity;
+  let aiReviewInFlight = false;
+  const activity: { at: number; toolName?: string; kind: "tool_start" | "tool_end" | "text" | "turn" }[] = [];
+  const activitySummary = (): string => activity.slice(-40).map(sample =>
+    `${sample.at}: ${sample.kind} ${sample.toolName ?? ""}`).join("\n").slice(-4_000) || "No recent activity.";
+  let reportedState: "suspicious" | "stuck" | undefined;
+  const reportState = (state: "suspicious" | "stuck" | undefined): void => {
+    if (reportedState === state) return;
+    reportedState = state;
+    options.onStuckState?.(state);
+  };
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
-        if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
-        if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
-        if (event.type === "message_end" && event.message.role === "assistant") {
-          const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-            cacheRead: u.cacheRead ?? 0,
-            cost: u.cost?.total ?? 0,
-          });
-        }
-        if (event.type === "compaction_end" && !event.aborted && event.result) {
-          options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
-        }
-      })
-    : () => {};
-
+  const requestSteer = (message: string): void => {
+    try { void Promise.resolve(session.steer(message)).catch(() => {}); } catch { /* disposed session */ }
+  };
+  const markStuck = (): void => {
+    if (aborted || settled || stuckAbortReason !== undefined) return;
+    if (!stuckAbortPending) {
+      stuckAbortPending = true;
+      reportState("stuck");
+      if (!stuckSteerSent) {
+        stuckSteerSent = true;
+        requestSteer("The agent appears stuck. Wrap up immediately — provide your final answer now.");
+      }
+      return;
+    }
+    stuckAbortPending = false;
+    stuckAbortReason = "The agent was aborted after sustained stuck activity.";
+    aborted = true;
+    session.abort();
+  };
+  const cancelPending = (): void => {
+    if (!stuckAbortPending) return;
+    stuckAbortPending = false;
+    stuckSteerSent = false;
+    detector.reset(Date.now());
+    reportState(undefined);
+  };
+  const evaluateDetection = async (): Promise<void> => {
+    if (settled || aborted) return;
+    const evaluation = detector.evaluate(Date.now());
+    if (evaluation.status === "healthy") { cancelPending(); reportState(undefined); return; }
+    reportState(evaluation.status === "stuck" ? "stuck" : "suspicious");
+    if (stuckAbortPending) { if (evaluation.status === "stuck") markStuck(); return; }
+    if (detectionMode === "rules+ai" && evaluation.suspicious && modelRegistry && !aiReviewInFlight && Date.now() - lastAiReviewAt >= aiInterval) {
+      aiReviewInFlight = true;
+      lastAiReviewAt = Date.now();
+      const verdict = await reviewStuckWithAi(
+        modelRegistry,
+        options.stuckAiModel ?? stuckAiModel,
+        activitySummary(),
+      ).finally(() => { aiReviewInFlight = false; });
+      if (verdict === false) { detector.reset(Date.now()); reportState(undefined); return; }
+      if (verdict === true) { markStuck(); return; }
+      return;
+    }
+    if (evaluation.status === "stuck") markStuck();
+  };
+  const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "tool_execution_start") {
+      cancelPending();
+      detector.record({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId, args: event.args, at: Date.now() });
+      options.onToolActivity?.({ type: "start", toolName: event.toolName });
+    }
+    if (event.type === "tool_execution_end") {
+      cancelPending();
+      detector.record({ type: "tool_end", toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError, at: Date.now() });
+      options.onToolActivity?.({ type: "end", toolName: event.toolName });
+    }
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      cancelPending();
+      detector.record({ type: "text", delta: event.assistantMessageEvent.delta, at: Date.now() });
+    }
+    if (event.type === "turn_end") detector.record({ type: "turn", at: Date.now() });
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const u = (event.message as any).usage;
+      if (u) options.onAssistantUsage?.({ input: u.input ?? 0, output: u.output ?? 0, cacheWrite: u.cacheWrite ?? 0, cacheRead: u.cacheRead ?? 0, cost: u.cost?.total ?? 0 });
+    }
+    if (event.type === "compaction_end" && !event.aborted && event.result) options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
+  });
+  detectionTimer = setInterval(() => { void evaluateDetection(); }, detectionInterval);
+  detectionTimer.unref?.();
   try {
     await session.prompt(prompt);
   } finally {
+    settled = true;
+    if (detectionTimer !== undefined) clearInterval(detectionTimer);
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
   }
-
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    aborted,
+    failure: stuckAbortReason ?? finalTurnError(session, startLen),
   };
 }
 

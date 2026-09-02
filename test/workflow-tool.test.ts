@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentManager } from "../src/agent-manager.js";
+import { AgentManager } from "../src/agent-manager.js";
 import { SUBAGENT_TOOL_NAMES } from "../src/agent-runner.js";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension, { WORKFLOW_ENTRY_TYPE, WORKFLOW_FILE_FLAG } from "../src/index.js";
@@ -120,6 +120,49 @@ describe("createWorkflowHost — spawn mapping", () => {
     // The label is the child's display description, so the fleet list and the
     // workflow tree name the same agent the same way.
     expect(options.description).toBe("review:bugs");
+  });
+
+  it("forwards stuck state changes from the manager to the workflow request", async () => {
+    const stub = stubManager(() => record({ id: "agent-stuck-callback" }));
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+    const onStuckState = vi.fn();
+
+    await host.spawnAgent(request({ onStuckState }));
+
+    const options = stub.spawnAndWait.mock.calls[0][4];
+    options.onStuckState("suspicious");
+    options.onStuckState("stuck");
+    expect(onStuckState.mock.calls).toEqual([["suspicious"], ["stuck"]]);
+  });
+
+  it("exposes the mapped record's stuck state through probeAgent", async () => {
+    let resolveSpawned: ((value: { id: string; record: AgentRecord }) => void) | undefined;
+    const child = record({ id: "agent-stuck", status: "running", stuckState: "stuck" });
+    const manager = {
+      spawnAndWait: vi.fn(
+        async (_pi: any, _ctx: any, _type: string, _prompt: string, _options: any, onSpawned?: (id: string) => void) => {
+          onSpawned?.(child.id);
+          return await new Promise<{ id: string; record: AgentRecord }>(resolve => {
+            resolveSpawned = resolve;
+          });
+        },
+      ),
+      getRecord: vi.fn(() => child),
+      abort: vi.fn(),
+    } as unknown as AgentManager;
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager });
+
+    const spawned = host.spawnAgent(request());
+    while (resolveSpawned === undefined) await Promise.resolve();
+
+    expect(host.probeAgent?.("wf-agent-0")).toEqual({
+      state: "pending",
+      status: "running",
+      stuckState: "stuck",
+      recordId: "agent-stuck",
+    });
+    resolveSpawned?.({ id: child.id, record: child });
+    await spawned;
   });
 
   it("passes isolation and the run's abort signal down to the spawn", async () => {
@@ -538,8 +581,22 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     await host.spawnAgent(request({ agentId: "wf-agent-0" }));
     const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
 
-    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined);
+    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined, undefined);
     expect(resumed).toMatchObject({ ok: true, text: "resumed" });
+  });
+
+  it("forwards stuck state changes while resuming an agent", async () => {
+    const stub = stubManager(() => record({ id: "manager-id-7" }));
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+    const onStuckState = vi.fn();
+
+    await host.spawnAgent(request({ agentId: "wf-agent-0" }));
+    await host.resumeAgent?.("wf-agent-0", "continue", undefined, onStuckState);
+
+    const options = stub.resume.mock.calls[0][3];
+    expect(options.onStuckState).toBe(onStuckState);
+    options.onStuckState("stuck");
+    expect(onStuckState).toHaveBeenCalledWith("stuck");
   });
 
   it("refuses to resume an agent the run never spawned", async () => {
@@ -622,6 +679,9 @@ describe("Workflow tool registration", () => {
     // here is a Workflow tool every spawned child inherits.
     expect(Object.values(SUBAGENT_TOOL_NAMES)).toContain("SubagentWorkflow");
     expect(SUBAGENT_TOOL_NAMES.WORKFLOW).toBe("SubagentWorkflow");
+    // The stop tool is excluded from subagents on the same boundary.
+    expect(Object.values(SUBAGENT_TOOL_NAMES)).toContain("StopSubagentWorkflow");
+    expect(SUBAGENT_TOOL_NAMES.STOP_WORKFLOW).toBe("StopSubagentWorkflow");
   });
 });
 
@@ -934,6 +994,43 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(String(line)).toContain("from-inline");
   });
 
+  it("notifies once for a stuck workflow agent and independently sends completion", async () => {
+    const spawn = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(
+      async (_pi: any, _ctx: any, _type: any, _prompt: any, options: any, onSpawned?: (id: string) => void) => {
+        options.onStuckState?.("stuck");
+        options.onStuckState?.("stuck");
+        const child = record({ id: "workflow-child", description: options.description });
+        onSpawned?.(child.id);
+        return { id: child.id, record: child };
+      },
+    );
+    try {
+      const result = await tools.get("SubagentWorkflow").execute(
+        "tc-stuck-notification",
+        { script: `${inlineScript}await agent("stuck child", { label: "review:item" });\nreturn "done";` },
+        undefined,
+        undefined,
+        workflowCtx(),
+      );
+      const taskId = startedTaskId(result);
+      await vi.waitFor(
+        () => expect(booted.pi.sendMessage.mock.calls.length).toBeGreaterThanOrEqual(2),
+        { timeout: 10_000 },
+      );
+      const messages = booted.pi.sendMessage.mock.calls;
+      const stuck = messages.filter((call: any[]) => String(call[0]?.content).includes("appears stuck"));
+      const completion = messages.find((call: any[]) => String(call[0]?.content).includes(taskId));
+      expect(stuck).toHaveLength(1);
+      expect(String(stuck[0][0].content)).toContain('Workflow "from-inline"');
+      expect(String(stuck[0][0].content)).toContain('agent "review:item"');
+      expect(stuck[0][1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+      expect(completion).toBeDefined();
+      expect(completion?.[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+    } finally {
+      spawn.mockRestore();
+    }
+  });
+
   it("actually runs the script in the background and notifies through the agent channel", async () => {
     const script = `${inlineScript}log("scanned 3 files");\nreturn "done here";\n`;
     const result = await tools.get("SubagentWorkflow").execute("tc-run", { script }, undefined, undefined, workflowCtx());
@@ -994,7 +1091,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     const sent = await awaitNotification(startedTaskId(result));
     expect(String(sent[0].content)).toContain("<status>Stopped</status>");
-  });
+  }, 20_000);
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {
     const result = await tools.get("SubagentWorkflow").execute(
@@ -1023,6 +1120,147 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     const sent = await awaitNotification(startedTaskId(result));
     expect(String(sent[0].content)).toContain("control characters");
     expect(sent[0].details).toMatchObject({ status: "error" });
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * StopSubagentWorkflow tool
+ * ------------------------------------------------------------------------- */
+
+describe("StopSubagentWorkflow tool", () => {
+  let hermetic: Hermetic;
+  let booted: ReturnType<typeof makePi>;
+  let tools: Map<string, any>;
+
+  beforeEach(() => {
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
+    booted = makePi();
+    subagentsExtension(booted.pi);
+    tools = booted.tools;
+  });
+
+  afterEach(async () => {
+    await flush();
+    hermetic.restore();
+    vi.restoreAllMocks();
+  });
+
+  const workflowCtx = () => ctx({ cwd: hermetic.dir });
+
+  it("is registered together with SubagentWorkflow when workflows are enabled", () => {
+    expect(tools.has("SubagentWorkflow")).toBe(true);
+    expect(tools.has("StopSubagentWorkflow")).toBe(true);
+  });
+
+  it("exposes exactly one required parameter, taskId", () => {
+    const tool = tools.get("StopSubagentWorkflow");
+    const params = tool.parameters as { properties?: Record<string, unknown>; required?: string[] };
+    expect(Object.keys(params.properties ?? {}), "only taskId is accepted").toEqual(["taskId"]);
+    expect(params.required).toContain("taskId");
+  });
+
+  it("explains the immediate-return and 5-second grace contract in its description", () => {
+    const description = String(tools.get("StopSubagentWorkflow").description);
+    expect(description).toContain("SubagentWorkflow");
+    expect(description.toLowerCase()).toContain("5-second");
+  });
+
+  it("leaves SubagentWorkflow's schema without a stop parameter", () => {
+    const properties = (tools.get("SubagentWorkflow").parameters as any).properties ?? {};
+    expect(properties).not.toHaveProperty("stop");
+  });
+
+  it("stops a running workflow and lets the runtime settle it as killed with one notification", async () => {
+    const spawn = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(
+      async (_pi: any, _ctx: any, _type: any, _prompt: any, _options: any, onSpawned?: (id: string) => void) =>
+        new Promise((_resolve) => {
+          onSpawned?.("wf-child");
+        }),
+    );
+    try {
+      const started = await tools.get("SubagentWorkflow").execute(
+        "tc-stop-run",
+        { script: `${inlineScript}await agent("hang");\n` },
+        undefined, undefined, workflowCtx(),
+      );
+      const taskId = (started.details as { taskId: string }).taskId;
+
+      const stop = await tools.get("StopSubagentWorkflow").execute(
+        "tc-stop-run-1",
+        { taskId },
+        undefined, undefined, workflowCtx(),
+      );
+      expect(textOf(stop)).toMatch(/Stop requested/);
+
+      const again = await tools.get("StopSubagentWorkflow").execute(
+        "tc-stop-run-2",
+        { taskId },
+        undefined, undefined, workflowCtx(),
+      );
+      expect(textOf(again)).toMatch(/already/);
+
+      // The stop tool returns immediately; the terminal record and the single
+      // completion notification are the runtime's job after the 5-second grace.
+      await vi.waitFor(
+        () => {
+          const count = booted.pi.sendMessage.mock.calls.filter(
+            (c: any[]) => String(c[0]?.content).includes(taskId),
+          ).length;
+          expect(count, "the completion notification must arrive exactly once").toBe(1);
+        },
+        { timeout: 10_000 },
+      );
+      const sent = booted.pi.sendMessage.mock.calls.find((c: any[]) => String(c[0]?.content).includes(taskId))!;
+      expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    } finally {
+      spawn.mockRestore();
+    }
+  }, 20_000);
+
+  it("reports a settled workflow's status without starting a new run or second notification", async () => {
+    const spawn = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(
+      async (_pi: any, _ctx: any, _type: any, _prompt: any, options: any, onSpawned?: (id: string) => void) => {
+        onSpawned?.("agent-1");
+        return { id: "agent-1", record: record({ description: options.description }) };
+      },
+    );
+    try {
+      const started = await tools.get("SubagentWorkflow").execute(
+        "tc-stop-settled",
+        { script: inlineScript },
+        undefined, undefined, workflowCtx(),
+      );
+      const taskId = (started.details as { taskId: string }).taskId;
+      await vi.waitFor(
+        () => expect(
+          booted.pi.sendMessage.mock.calls.some((c: any[]) => String(c[0]?.content).includes(taskId)),
+        ).toBe(true),
+        { timeout: 10_000 },
+      );
+      const before = booted.pi.sendMessage.mock.calls.length;
+
+      const stop = await tools.get("StopSubagentWorkflow").execute(
+        "tc-stop-settled-1",
+        { taskId },
+        undefined, undefined, workflowCtx(),
+      );
+      expect(textOf(stop)).toMatch(/already completed/);
+
+      await flush();
+      expect(booted.pi.sendMessage.mock.calls.length).toBe(before);
+    } finally {
+      spawn.mockRestore();
+    }
+  }, 20_000);
+
+  it("refuses an unknown taskId clearly", async () => {
+    const stop = await tools.get("StopSubagentWorkflow").execute(
+      "tc-stop-unknown",
+      { taskId: "wf_deadbeef1234" },
+      undefined, undefined, workflowCtx(),
+    );
+    expect(textOf(stop)).toMatch(/Unknown workflow task/);
+    expect(textOf(stop)).not.toMatch(/started/);
   });
 });
 
@@ -1236,6 +1474,7 @@ describe("workflowsEnabled — the master switch", () => {
     const booted = boot({});
 
     expect(booted.tools.has("SubagentWorkflow")).toBe(true);
+    expect(booted.tools.has("StopSubagentWorkflow")).toBe(true);
     // Nothing else is affected.
     expect(booted.tools.has("Agent")).toBe(true);
   });
@@ -1243,11 +1482,15 @@ describe("workflowsEnabled — the master switch", () => {
   it("stays off when the setting says so explicitly", () => {
     // Not registered at all: the model is never told the feature exists. The
     // switch buys zero tool-spec tokens, which a refusing tool would not.
-    expect(boot({ workflowsEnabled: false }).tools.has("SubagentWorkflow")).toBe(false);
+    const booted = boot({ workflowsEnabled: false });
+    expect(booted.tools.has("SubagentWorkflow")).toBe(false);
+    expect(booted.tools.has("StopSubagentWorkflow")).toBe(false);
   });
 
   it("registers the tool once the setting turns it on", () => {
-    expect(boot({ workflowsEnabled: true }).tools.has("SubagentWorkflow")).toBe(true);
+    const booted = boot({ workflowsEnabled: true });
+    expect(booted.tools.has("SubagentWorkflow")).toBe(true);
+    expect(booted.tools.has("StopSubagentWorkflow")).toBe(true);
   });
 
   it("refuses the startup flag while off, instead of running the script anyway", async () => {

@@ -36,10 +36,8 @@ export const WORKFLOW_NESTED_CAP = 256;
 /** How much of a prompt or result is kept for the UI. */
 const PREVIEW_LENGTH = 200;
 
-/** How long after an abort notice a wedged worker gets before hard-terminate. */
-const ABORT_GRACE_MS = 2_000;
-/** How long a responsive worker has to acknowledge an abort-notice. */
-const ABORT_ACK_MS = 100;
+/** How long after an abort notice a worker gets before hard-terminate. */
+const ABORT_GRACE_MS = 5_000;
 /** Watchdog poll cadence. */
 const WATCHDOG_INTERVAL_MS = 30_000;
 /** Idle before an `idle_warning` run_status is emitted. */
@@ -105,6 +103,8 @@ export interface WorkflowSpawnRequest {
    * that cannot report any of this simply does not, and the row keeps the
    * requested values it started with.
    */
+  /** Reports agent-level stuck-detector transitions while the child is running. */
+  onStuckState?(state: "suspicious" | "stuck" | undefined): void;
   onResolved?(info: {
     /**
      * The host's own id for the child — the manager's `AgentRecord` id here.
@@ -225,6 +225,8 @@ export interface WorkflowHostProbe {
   state: "pending" | "terminal" | "missing";
   /** The record's own status, when there is one. */
   status?: string;
+  /** Latest agent-level stuck-detector state, when available. */
+  stuckState?: "suspicious" | "stuck";
   /** The manager's record id this runtime id maps to. */
   recordId?: string;
 }
@@ -282,6 +284,7 @@ export interface WorkflowHost {
      * the row above it shows the one that ran.
      */
     onResolved?: WorkflowSpawnRequest["onResolved"],
+    onStuckState?: WorkflowSpawnRequest["onStuckState"],
   ): Promise<WorkflowSpawnResult>;
   /**
    * Run a `gate` command and report whether it passed.
@@ -406,7 +409,7 @@ export interface RunWorkflowOptions {
   /**
    * How long after an abort notice the worker gets to converge — run its
    * `finally`, call `__onWorkflowAbort`, return — before it is hard-terminated.
-   * Defaults to 2000ms.
+   * Defaults to 5000ms.
    */
   abortGraceMs?: number;
   /** Called once when the run settles — killed/failed/completed alike. */
@@ -452,6 +455,8 @@ export interface WorkflowRunResult {
   agentCount: number;
   /** How many of those came back from the journal instead of being spawned. */
   replayedCount: number;
+  /** The last agent still mid-flight when the run stopped, for diagnostics. */
+  lastAgent?: { index: number; label: string; state: WorkflowAgentEntry["state"] };
 }
 
 /* ------------------------------------------------------------------------- *
@@ -922,8 +927,6 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     let watchdog: ReturnType<typeof setInterval> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
-    let abortAckTimer: ReturnType<typeof setTimeout> | undefined;
-    let abortAcked = false;
 
     const finish = (result: Omit<WorkflowRunResult, "meta" | "progress" | "agentCount" | "replayedCount">) => {
       if (settled) return;
@@ -932,7 +935,6 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       const outcome = aborted ? { status: "killed" as const, error: "Workflow aborted." } : result;
       settled = true;
       if (graceTimer !== undefined) clearTimeout(graceTimer);
-      if (abortAckTimer !== undefined) clearTimeout(abortAckTimer);
       if (watchdog !== undefined) clearInterval(watchdog);
       if (heartbeat !== undefined) clearInterval(heartbeat);
       options.signal?.removeEventListener("abort", onAbort);
@@ -966,12 +968,20 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         ...(lastAgent !== undefined ? { lastAgent } : {}),
         progress: progress.filter(entry => entry.type !== "workflow_agent" || entry.state !== "start"),
       };
-      options.onTerminal?.(summary);
-      options.persistRunSummary?.(summary);
+      try {
+        options.onTerminal?.(summary);
+      } catch (error) {
+        console.warn(`[pi-subagents] workflow terminal notification failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
+        options.persistRunSummary?.(summary);
+      } catch (error) {
+        console.warn(`[pi-subagents] workflow run status persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
 
       // Resolve only once the thread is actually down, so a caller that awaits
       // runWorkflow() is guaranteed not to be leaking one.
-      const settle = () => resolve({ ...outcome, meta, progress, agentCount, replayedCount });
+      const settle = () => resolve({ ...outcome, meta, progress, agentCount, replayedCount, ...(lastAgent !== undefined ? { lastAgent } : {}) });
       void worker.terminate().then(settle, settle);
     };
 
@@ -987,13 +997,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       worker.postMessage({ type: "abort-notice" });
       // 3) The grace window is the script's chance to converge; terminate() is
       //    the fallback for a script that spins or wedges (the reason the run
-      //    lives in a worker at all). A worker that never acknowledges the
-      //    notice — a synchronous `for(;;)` — is cut short well inside the
-      //    grace so it does not burn a core for the whole window.
-      abortAckTimer = setTimeout(() => {
-        abortAckTimer = undefined;
-        if (!abortAcked) finish({ status: "killed", error: "Workflow aborted." });
-      }, ABORT_ACK_MS);
+      //    lives in a worker at all).
       graceTimer = setTimeout(() => {
         graceTimer = undefined;
         finish({ status: "killed", error: "Workflow aborted." });
@@ -1017,6 +1021,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     const idleStalledMs = options.idleStalledMs ?? IDLE_STALLED_MS;
     const phaseTimeoutMs = options.phaseTimeoutMs ?? PHASE_TIMEOUT_MS;
     let watchdogState: "idle" | "warned" | "stalled" = "idle";
+    const reportedStuckAgents = new Set<string>();
     const deliveryGraceMs = options.deliveryGraceMs ?? DELIVERY_GRACE_MS;
     watchdog = setInterval(() => {
       if (settled) return;
@@ -1031,6 +1036,22 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         const now = Date.now();
         for (const [agentId, pending] of pendingDeliveries) {
           const probe = host.probeAgent(agentId);
+          if (probe?.stuckState === "stuck" && !reportedStuckAgents.has(agentId)) {
+            reportedStuckAgents.add(agentId);
+            emit([{
+              type: "run_status",
+              state: "agent_stuck",
+              idleMs: Math.max(
+                0,
+                now -
+                  (progress
+                    .filter((entry): entry is WorkflowAgentEntry => entry.type === "workflow_agent" && entry.agentId === agentId)
+                    .at(-1)?.lastProgressAt ?? now),
+              ),
+              agentLabel: pending.label,
+              agentId,
+            }]);
+          }
           if (probe === undefined || probe.state === "pending") {
             // Running/queued, or the host cannot say: healthy — never flagged.
             pending.terminalSince = undefined;
@@ -1353,6 +1374,19 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             label,
             fail() { deliveryResolve(DELIVERY_FAILED); },
           };
+          const reportStuckState: WorkflowSpawnRequest["onStuckState"] = state => {
+            if (state !== "stuck" || reportedStuckAgents.has(agentId)) return;
+            reportedStuckAgents.add(agentId);
+            emit([{
+              type: "run_status",
+              state: "agent_stuck",
+              idleMs: Math.max(0, Date.now() - (progress
+                .filter((entry): entry is WorkflowAgentEntry => entry.type === "workflow_agent" && entry.agentId === agentId)
+                .at(-1)?.lastProgressAt ?? Date.now())),
+              agentLabel: label,
+              agentId,
+            }]);
+          };
           pendingDeliveries.set(agentId, pendingDelivery);
 
           let result: WorkflowSpawnResult;
@@ -1360,7 +1394,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           try {
             const raced = await Promise.race<WorkflowSpawnResult | typeof DELIVERY_FAILED>([
               resumed !== undefined && resumeAgent !== undefined
-                ? resumeAgent(resumed.agentId, payload.prompt, onResolved)
+                ? resumeAgent(resumed.agentId, payload.prompt, onResolved, reportStuckState)
                 : host.spawnAgent({
                     agentId,
                     index,
@@ -1373,6 +1407,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     ...(isolation !== undefined ? { isolation } : {}),
                     ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
                     ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
+                    onStuckState: reportStuckState,
                     // Offered, not delegated: a host that can run it inside the
                     // child's worktree does, and hands back `result.gate`.
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
@@ -1576,10 +1611,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           void handleAgent(message.callId, message.payload as AgentCallPayload);
           break;
         case "abort-ack":
-          // The worker saw the abort-notice, so it is responsive and the full
-          // grace window applies — nothing to kill early.
-          abortAcked = true;
-          if (abortAckTimer !== undefined) clearTimeout(abortAckTimer);
+          // The acknowledgement is observational only; the configured grace
+          // deadline remains the sole hard-termination path.
           break;
         case "complete": {
           // The script is done, so every launch it made should have been

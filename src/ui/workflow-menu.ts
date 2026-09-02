@@ -16,7 +16,7 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord } from "../types.js";
-import { pauseWorkflowTask, resumeWorkflowTask, type WorkflowTask } from "../workflow/task.js";
+import { pauseWorkflowTask, requestStopWorkflowTask, resumeWorkflowTask, type WorkflowTask } from "../workflow/task.js";
 import { WorkflowDialog } from "./workflow-dialog.js";
 
 /** Everything the menu and the inspector need from the extension around them. */
@@ -90,9 +90,12 @@ export async function showWorkflowDialog(
         done,
         {
           onKill: () => {
-            if (task.abortController.signal.aborted) return;
-            task.abortController.abort();
-            ctx.ui.notify(`Stopped workflow "${task.meta?.name ?? task.id}".`, "info");
+            // Same helper the StopSubagentWorkflow tool uses: one place decides
+            // whether there was anything left to stop.
+            const outcome = requestStopWorkflowTask(task);
+            if (outcome.kind !== "already-stopping") {
+              ctx.ui.notify(`Stopped workflow "${task.meta?.name ?? task.id}".`, "info");
+            }
           },
           onPause: () => {
             if (pauseWorkflowTask(task)) {

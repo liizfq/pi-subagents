@@ -15,7 +15,9 @@ import {
   completeWorkflowTask,
   createWorkflowTask,
   failWorkflowTask,
+  formatWorkflowNotification,
   pauseWorkflowTask,
+  requestStopWorkflowTask,
   resumeWorkflowTask,
   type WorkflowTask,
 } from "../src/workflow/task.js";
@@ -36,6 +38,30 @@ function runningTask(): { task: WorkflowTask; control: ReturnType<typeof stubCon
   task.control = control;
   return { task, control };
 }
+
+describe("stopping a run", () => {
+  it("aborts running and paused tasks exactly once", () => {
+    const { task, control } = runningTask();
+    expect(requestStopWorkflowTask(task)).toEqual({ kind: "requested" });
+    expect(task.abortController.signal.aborted).toBe(true);
+    expect(requestStopWorkflowTask(task)).toEqual({ kind: "already-stopping" });
+    expect(control.pause).not.toHaveBeenCalled();
+  });
+
+  it("reports settled tasks without aborting them", () => {
+    const task = createWorkflowTask({ id: "wf_done", script: "" });
+    completeWorkflowTask(task, { ...resultForStopTest, status: "killed" });
+    expect(requestStopWorkflowTask(task)).toEqual({ kind: "settled", status: "killed" });
+  });
+});
+
+const resultForStopTest = {
+  status: "completed" as const,
+  meta: { name: "wf", description: "d" },
+  progress: [],
+  agentCount: 0,
+  replayedCount: 0,
+};
 
 describe("pausing a run", () => {
   it("tells the run to hold, not just the record", () => {
@@ -128,5 +154,39 @@ describe("settling a run", () => {
 
     expect(task.control).toBeUndefined();
     expect(task.status).toBe("failed");
+  });
+});
+
+describe("terminal notification", () => {
+  it("names the last unconverged agent when the run is stopped or errored", () => {
+    const task = createWorkflowTask({ id: "wf_abc123", script: "" });
+    const result = {
+      status: "killed" as const,
+      error: "Workflow aborted.",
+      meta: { name: "wf", description: "d" },
+      progress: [],
+      agentCount: 1,
+      replayedCount: 0,
+      lastAgent: { index: 0, label: "audit:src/a.ts", state: "progress" },
+    };
+    completeWorkflowTask(task, result);
+    const notification = formatWorkflowNotification(task, 2_000);
+    expect(notification).toContain("audit:src/a.ts");
+  });
+
+  it("omits the last-agent line for a completed run", () => {
+    const task = createWorkflowTask({ id: "wf_abc123", script: "" });
+    const result = {
+      status: "completed" as const,
+      value: "done",
+      meta: { name: "wf", description: "d" },
+      progress: [],
+      agentCount: 1,
+      replayedCount: 0,
+      lastAgent: { index: 0, label: "audit:src/a.ts", state: "done" },
+    };
+    completeWorkflowTask(task, result);
+    const notification = formatWorkflowNotification(task, 2_000);
+    expect(notification).not.toContain("audit:src/a.ts");
   });
 });

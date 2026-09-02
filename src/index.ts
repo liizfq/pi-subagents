@@ -62,7 +62,7 @@ import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
-import { decideWorkflowCollision, FOREIGN_WORKFLOW_TOOL_NAMES } from "./workflow/collisions.js";
+import { decideAgentCollision, decideWorkflowCollision, FOREIGN_WORKFLOW_TOOL_NAMES } from "./workflow/collisions.js";
 import { WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData } from "./workflow/entry.js";
 import { createWorkflowHost } from "./workflow/host.js";
 import { appendJournal, readJournal, type WorkflowJournalEntry } from "./workflow/journal.js";
@@ -70,7 +70,7 @@ import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/met
 import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow, type WorkflowRunSummary } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
-import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, requestStopWorkflowTask, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
@@ -847,6 +847,7 @@ export default function (pi: ExtensionAPI) {
     // extension factory has run, so this is the earliest point the real value
     // exists. Detached inside — a workflow must not hold up session startup.
     resolveWorkflowCollisions(ctx);
+    resolveAgentCollisions(ctx);
     runWorkflowFlag(ctx);
   });
 
@@ -2361,7 +2362,30 @@ Terse command-style prompts produce shallow, generic work.
           rootSessionId: ctx.sessionManager.getSessionId(),
           workflowId: task.id,
         }),
-        onProgress: entries => updateWorkflowProgressBatch(task, entries),
+        onProgress: entries => {
+          updateWorkflowProgressBatch(task, entries);
+          for (const entry of entries) {
+            if (entry.type !== "run_status" || entry.state !== "agent_stuck") continue;
+            const key = `agent-stuck-${task.id}-${entry.agentId ?? entry.agentLabel ?? "unknown"}`;
+            scheduleNudge(key, () => {
+              pi.sendMessage<NotificationDetails>({
+                customType: "subagent-notification",
+                content: `Workflow "${task.workflowName ?? task.id}" agent "${entry.agentLabel ?? "unknown"}" appears stuck.`,
+                display: true,
+                details: {
+                  id: task.id,
+                  description: `Workflow ${task.workflowName ?? task.id}`,
+                  status: "running",
+                  toolUses: task.totalToolCalls,
+                  turnCount: 0,
+                  totalTokens: task.totalTokens,
+                  durationMs: elapsedMs(task, Date.now()),
+                  resultPreview: "",
+                },
+              }, { deliverAs: "followUp", triggerTurn: true });
+            });
+          }
+        },
         // The dialog's pause / skip / retry keys run through this; it is dropped
         // again when the task settles.
         onControl: control => { task.control = control; },
@@ -2638,7 +2662,36 @@ Terse command-style prompts produce shallow, generic work.
     },
   });
 
-  if (isWorkflowsEnabled()) pi.registerTool(workflowTool);
+  const stopWorkflowTool = defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP_WORKFLOW,
+    label: "StopSubagentWorkflow",
+    description:
+      "Stop a running or paused workflow in the current session. `taskId` comes from the SubagentWorkflow return value. " +
+      "Returns immediately after requesting the stop; the terminal status and completion notification follow after the 5-second abort grace period.",
+    promptSnippet: "Stop a running or paused workflow",
+    parameters: Type.Object({
+      taskId: Type.String({
+        description: "Task ID returned by SubagentWorkflow; only workflow runs in the current session can be stopped.",
+      }),
+    }),
+    execute: async (_toolCallId, params) => {
+      const task = workflowTasks.get(params.taskId);
+      if (task === undefined) return textResult(`Unknown workflow task "${params.taskId}" in this session.`);
+      const outcome = requestStopWorkflowTask(task);
+      if (outcome.kind === "requested") {
+        return textResult(`Stop requested for workflow "${params.taskId}". It will settle after the abort grace period.`);
+      }
+      if (outcome.kind === "already-stopping") {
+        return textResult(`Stop already requested for workflow "${params.taskId}".`);
+      }
+      return textResult(`Workflow "${params.taskId}" is already ${outcome.status}.`);
+    },
+  });
+
+  if (isWorkflowsEnabled()) {
+    pi.registerTool(workflowTool);
+    pi.registerTool(stopWorkflowTool);
+  }
 
   /**
    * Act on {@link decideWorkflowCollision} — the half that needs the host.
@@ -2696,12 +2749,41 @@ Terse command-style prompts produce shallow, generic work.
 
       if (!verdict.withdraw) return;
       const active = pi.getActiveTools();
-      if (active.includes(SUBAGENT_TOOL_NAMES.WORKFLOW)) {
-        pi.setActiveTools(active.filter(name => name !== SUBAGENT_TOOL_NAMES.WORKFLOW));
+      const withdraw: string[] = [SUBAGENT_TOOL_NAMES.WORKFLOW, SUBAGENT_TOOL_NAMES.STOP_WORKFLOW];
+      if (withdraw.some(name => active.includes(name))) {
+        pi.setActiveTools(active.filter(name => !withdraw.includes(name)));
       }
     } catch {
       // getAllTools/setActiveTools are unavailable in some hosts (print mode,
       // RPC). Not being able to check is not a reason to fail the session.
+    }
+  }
+
+  /**
+   * If a foreign extension registered a tool named `Agent` first, pi kept
+   * the foreign one and dropped ours. `stop_subagent` is orphaned without
+   * `Agent`, so it must be withdrawn from the active set too.
+   */
+  function resolveAgentCollisions(ctx: ExtensionContext): void {
+    const warn = (message: string) => {
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else console.warn(`[pi-subagents] ${message}`);
+    };
+    try {
+      const verdict = decideAgentCollision({
+        tools: pi.getAllTools(),
+        ownDescription: registeredAgentTool.description,
+      });
+      if (verdict.kind === "none") return;
+      warn(verdict.message ?? "");
+      if (!verdict.withdraw) return;
+      const active = pi.getActiveTools();
+      const withdraw: string[] = [SUBAGENT_TOOL_NAMES.STOP_SUBAGENT];
+      if (withdraw.some(name => active.includes(name))) {
+        pi.setActiveTools(active.filter(name => !withdraw.includes(name)));
+      }
+    } catch {
+      // Same as resolveWorkflowCollisions: hosts without these APIs are fine.
     }
   }
 
@@ -2929,6 +3011,36 @@ Terse command-style prompts produce shallow, generic work.
       } catch (err) {
         return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+  }));
+
+  // ---- stop_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP_SUBAGENT,
+    label: "Stop Subagent",
+    description:
+      "Stop a running or queued subagent by its id (the id returned by the Agent tool). " +
+      "The agent is aborted immediately; the call does not wait for it to finish.",
+    promptSnippet: "Stop a running or queued subagent",
+    parameters: Type.Object({
+      id: Type.String({
+        description: "The subagent id to stop, as returned by the Agent tool.",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.id);
+      if (!record) {
+        return textResult(`Unknown subagent id '${params.id}' in this session.`);
+      }
+      if (!isTopLevelAgent(record)) {
+        return textResult(`Subagent '${params.id}' is owned by another agent.`);
+      }
+      if (record.status !== "running" && record.status !== "queued") {
+        return textResult(`Subagent '${params.id}' is already settled (status: ${record.status}).`);
+      }
+      manager.abort(params.id);
+      return textResult(`Stopped subagent '${params.id}'.`);
     },
   }));
 
@@ -3760,7 +3872,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "stuckRuleIntervalMs",
           label: "Stuck rule interval",
-          description: "Milliseconds between rule evaluations (default 30000)",
+          description: "Milliseconds between rule evaluations (default 60000)",
           currentValue: String(getStuckRuleIntervalMs()),
           values: [String(getStuckRuleIntervalMs())],
         },

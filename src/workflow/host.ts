@@ -342,6 +342,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // Fires once the child's session exists, which is where the model
             // and the clamped thinking level first become knowable.
             onSessionCreated: () => { sessionReady = true; reportResolved(); },
+            ...(request.onStuckState !== undefined ? {
+              onStuckState: request.onStuckState,
+            } : {}),
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
@@ -388,16 +391,22 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       return {
         state: TERMINAL_STATUSES.has(record.status) ? "terminal" : "pending",
         status: record.status,
+        ...(record.stuckState !== undefined ? { stuckState: record.stuckState } : {}),
         recordId: id,
       };
     },
 
-    async resumeAgent(agentId, prompt, onResolved) {
+    async resumeAgent(agentId, prompt, onResolved, onStuckState) {
       const id = records.get(agentId);
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
-      const record = await manager.resume(id, prompt, deps.signal);
+      const record = await manager.resume(
+        id,
+        prompt,
+        deps.signal,
+        onStuckState === undefined ? undefined : { onStuckState },
+      );
       if (record === undefined) {
         return {
           ok: false,

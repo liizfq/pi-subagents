@@ -2091,6 +2091,26 @@ describe("AgentManager — background resume", () => {
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
 
+  it("a stuck background resume maps to aborted and keeps its reason", async () => {
+    const onComplete = vi.fn();
+    manager = new AgentManager(onComplete);
+    const id = await spawnSettled(manager);
+    onComplete.mockClear();
+
+    vi.mocked(resumeAgent).mockResolvedValue({
+      text: "partial",
+      aborted: true,
+      failure: "The agent was aborted after sustained stuck activity.",
+    } as any);
+
+    const record = await manager.resume(id, "again", undefined, { isBackground: true });
+    await record!.promise;
+
+    expect(manager.getRecord(id)!.status).toBe("aborted");
+    expect(manager.getRecord(id)!.error).toBe("The agent was aborted after sustained stuck activity.");
+    expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
   it("a failed final turn on a background resume maps to error and still notifies", async () => {
     const onComplete = vi.fn();
     manager = new AgentManager(onComplete);
@@ -2155,6 +2175,22 @@ describe("AgentManager — background resume", () => {
 
     expect(record?.status).toBe("queued");
     expect(resumeAgent).not.toHaveBeenCalled();
+  });
+
+  it("a stuck foreground resume maps to aborted and keeps its reason", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+
+    vi.mocked(resumeAgent).mockResolvedValue({
+      text: "partial",
+      aborted: true,
+      failure: "The agent was aborted after sustained stuck activity.",
+    } as any);
+
+    const record = await manager.resume(id, "again");
+
+    expect(record?.status).toBe("aborted");
+    expect(record?.error).toBe("The agent was aborted after sustained stuck activity.");
   });
 
   it("foreground resume is unchanged: awaits inline and does not fire onComplete", async () => {

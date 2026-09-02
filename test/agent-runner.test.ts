@@ -356,6 +356,89 @@ describe("agent-runner final output capture", () => {
     expect(result.failure).toBeUndefined();
   });
 
+  it("runs the stuck detector through a resumed turn and cleans up its timer", async () => {
+    vi.useFakeTimers();
+    const { session, listeners } = createSession("");
+    const states: Array<"suspicious" | "stuck" | undefined> = [];
+    const detector = {
+      record: vi.fn(),
+      evaluate: vi.fn(() => ({ status: "suspicious", suspicious: true, suspiciousWindows: 1 })),
+      reset: vi.fn(),
+    };
+    let finishPrompt!: () => void;
+    session.prompt.mockImplementation(async () => {
+      for (const listener of listeners) listener({ type: "tool_execution_start", toolName: "read", args: { path: "x" }, at: 1 });
+      await new Promise<void>(resolve => { finishPrompt = resolve; });
+    });
+    session.abort.mockImplementation(() => finishPrompt?.());
+    const promise = resumeAgent(session as any, "Continue", {
+      stuckDetection: "rules",
+      stuckRuleIntervalMs: 10,
+      stuckDetector: detector,
+      onStuckState: state => states.push(state),
+    } as any);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(detector.evaluate).toHaveBeenCalled();
+    expect(states).toContain("suspicious");
+    expect(session.prompt).toHaveBeenCalled();
+    session.abort();
+    finishPrompt();
+    await promise;
+    vi.useRealTimers();
+  });
+
+  it("runs the AI stuck reviewer during a resumed rules+ai turn", async () => {
+    vi.useFakeTimers();
+    const { session } = createSession("");
+    const detector = {
+      record: vi.fn(),
+      evaluate: vi.fn(() => ({ status: "suspicious", suspicious: true, suspiciousWindows: 1 })),
+      reset: vi.fn(),
+    };
+    const complete = vi.fn().mockResolvedValue({ content: [{ type: "text", text: '{"stuck":false}' }] });
+    const context = { ...ctx, modelRegistry: { ...ctx.modelRegistry, getAvailable: vi.fn(() => [{ provider: "test", id: "reviewer", name: "reviewer" }]), find: vi.fn(() => ({ provider: "test", id: "reviewer" })), complete } };
+    let finishPrompt!: () => void;
+    session.prompt.mockImplementation(() => new Promise<void>(resolve => { finishPrompt = resolve; }));
+    const promise = resumeAgent(session as any, "Continue", {
+      stuckDetection: "rules+ai",
+      stuckRuleIntervalMs: 10,
+      stuckAiIntervalMs: 20,
+      stuckAiModel: "test/reviewer",
+      stuckDetector: detector,
+      modelRegistry: context.modelRegistry,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalled());
+    expect(detector.reset).toHaveBeenCalled();
+    finishPrompt();
+    await promise;
+    vi.useRealTimers();
+  });
+
+  it("only reports resumed stuck states when the state changes", async () => {
+    vi.useFakeTimers();
+    const { session } = createSession("");
+    const detector = {
+      record: vi.fn(),
+      evaluate: vi.fn(() => ({ status: "suspicious", suspicious: true, suspiciousWindows: 1 })),
+      reset: vi.fn(),
+    };
+    const states: Array<"suspicious" | "stuck" | undefined> = [];
+    let finishPrompt!: () => void;
+    session.prompt.mockImplementation(() => new Promise<void>(resolve => { finishPrompt = resolve; }));
+    const promise = resumeAgent(session as any, "Continue", {
+      stuckDetection: "rules",
+      stuckRuleIntervalMs: 10,
+      stuckDetector: detector,
+      onStuckState: state => states.push(state),
+    });
+    await vi.advanceTimersByTimeAsync(35);
+    expect(states).toEqual(["suspicious"]);
+    finishPrompt();
+    await promise;
+    vi.useRealTimers();
+  });
+
   it("sets the agent name as session name before binding extensions", async () => {
     const { session } = createSession("NAMED");
     createAgentSession.mockResolvedValue({ session });

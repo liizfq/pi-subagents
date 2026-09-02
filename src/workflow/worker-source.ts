@@ -771,6 +771,8 @@ async function main() {
     workflow: rootScope.workflow,
     budget: makeBudget(),
     console: rootScope.console,
+    setTimeout: setTimeout,
+    clearTimeout: clearTimeout,
     // Optional abort hook. The script assigns it (\`__onWorkflowAbort = () => {}\`);
     // a script that never does simply never gets the callback.
     __onWorkflowAbort: undefined,

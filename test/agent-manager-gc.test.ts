@@ -57,7 +57,30 @@ describe("AgentManager — record GC", () => {
     return { id, record: manager.getRecord(id)! };
   }
 
-  it("keeps a record that completed inside the retention window", async () => {
+  it("cleans the model registry when a completed record is evicted", async () => {
+    manager = new AgentManager();
+    const { id, record } = await settled("registry");
+    const registries = (manager as unknown as { modelRegistries: Map<string, unknown> }).modelRegistries;
+    expect(registries.has(id)).toBe(true);
+
+    record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(registries.has(id)).toBe(false);
+  });
+
+  it("cleans the model registry when disposed", async () => {
+    manager = new AgentManager();
+    const { id } = await settled("dispose registry");
+    const registries = (manager as unknown as { modelRegistries: Map<string, unknown> }).modelRegistries;
+    expect(registries.has(id)).toBe(true);
+
+    await manager.dispose();
+
+    expect(registries.has(id)).toBe(false);
+  });
+
+  it("keeps a record that completed inside the retention window, including its registry", async () => {
     manager = new AgentManager();
     const { id, record } = await settled("recent");
     // Age at sweep time is (TEN_MINUTES - 2*TICK) + TICK — just inside the window.
