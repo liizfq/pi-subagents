@@ -643,6 +643,215 @@ async function pipeline(items, ...stages) {
 }
 
 /**
+ * Strictly serial steps with failure short-circuit: step N+1 runs only after
+ * step N completes, and the first failed step stops the chain. The serial
+ * counterpart to \`pipeline()\`: where \`pipeline\` fans items out independently,
+ * \`chain\` is a single ordered path — the primitive for steps that depend on
+ * the previous step's output.
+ *
+ * \`agent()\` resolves to the step's result text on success, or \`null\` when
+ * the step fails or is skipped. A fatal run error (a cap breach or an abort)
+ * rethrows exactly as \`parallel()\`/\`pipeline()\` do, so the run fails
+ * instead of the chain silently carrying on.
+ */
+async function chain(steps) {
+  const list = toList(steps, "chain(steps)");
+  for (let i = 0; i < list.length; i++) {
+    requireText(list[i], "chain(steps)");
+  }
+  for (const step of list) {
+    let result;
+    try {
+      result = await rootScope.agent(step);
+    } catch (error) {
+      if (isFatal(error)) throw error;
+      result = null;
+    }
+    if (result === null) {
+      logIn(rootScope, "chain: stopped at step '" + step + "' — prior step failed.");
+      return { ok: false, failedAt: step };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * The \`dag({ nodes })\` global — a directed-acyclic-graph scheduler.
+ *
+ * Where \`parallel()\` is a barrier and \`chain()\` is strictly serial, \`dag()\`
+ * lets a script declare nodes with \`deps\` edges; the runtime topologically
+ * sorts them (Kahn's algorithm, so a cycle is detected and thrown), then runs
+ * every node whose deps have all resolved **concurrently** — the host's
+ * semaphore bounds real concurrency, so this stays within the run's cap. A
+ * node whose \`agent()\` fails (resolves to \`null\`, or a non-fatal rejection)
+ * marks itself and **all of its transitive dependents** \`skipped\`: they are
+ * never launched. The result is a map of nodeId → { ok, text?, skipped?, reason? }.
+ */
+function toDagNodes(spec) {
+  const what = "dag({ nodes })";
+  if (spec === undefined || spec === null || typeof spec !== "object" || Array.isArray(spec)) {
+    throw new Error(what + " expects an object with a nodes map.");
+  }
+  const nodes = spec.nodes;
+  if (nodes === undefined || nodes === null || typeof nodes !== "object" || Array.isArray(nodes)) {
+    throw new Error(what + " expects a \`nodes\` map of id to { prompt, deps?, label? }.");
+  }
+  const ids = Object.keys(nodes);
+  if (ids.length > ITEM_CAP) {
+    throw new Error(what + " was given " + ids.length + " nodes, over the limit of " + ITEM_CAP + ".");
+  }
+  for (const id of ids) {
+    const node = nodes[id];
+    if (node === undefined || node === null || typeof node !== "object" || Array.isArray(node)) {
+      throw new Error(what + " node '" + id + "' must be an object.");
+    }
+    requireText(node.prompt, what + " node '" + id + "' prompt");
+    if (node.deps !== undefined && !Array.isArray(node.deps)) {
+      throw new Error(what + " node '" + id + "' deps must be an array of node ids.");
+    }
+    for (const dep of node.deps || []) {
+      if (typeof dep !== "string" || nodes[dep] === undefined) {
+        throw new Error(what + " node '" + id + "' depends on unknown node '" + dep + "'.");
+      }
+    }
+    if (node.label !== undefined) requireText(node.label, what + " node '" + id + "' label");
+  }
+  return nodes;
+}
+
+async function dag(spec) {
+  const nodes = toDagNodes(spec);
+  const ids = Object.keys(nodes);
+
+  // Kahn's algorithm: build in-degrees and successor lists, then detect cycles.
+  const inDegree = {};
+  const successors = {};
+  for (const id of ids) { inDegree[id] = 0; successors[id] = []; }
+  for (const id of ids) {
+    for (const dep of nodes[id].deps || []) {
+      inDegree[id]++;
+      (successors[dep] || (successors[dep] = [])).push(id);
+    }
+  }
+  const q = ids.filter(id => inDegree[id] === 0);
+  let processed = 0;
+  while (q.length > 0) {
+    const id = q.shift();
+    processed++;
+    for (const succ of successors[id]) {
+      inDegree[succ]--;
+      if (inDegree[succ] === 0) q.push(succ);
+    }
+  }
+  if (processed < ids.length) {
+    const cyclic = ids.filter(id => inDegree[id] > 0);
+    throw new Error(
+      "dag() nodes contain a dependency cycle: " + cyclic.join(" -> ") + " -> " + cyclic[0] + "."
+    );
+  }
+
+  const results = {};
+  const finished = new Set();
+  const failed = new Set();
+  const skipped = new Set();
+  const pending = new Set(ids);
+  // In-flight agent calls, pruned as each settles, so the loop can wait for
+  // every launched node to finish before returning (un-awaited agents would
+  // fail the run).
+  const inFlight = new Map();
+
+  // Mark a failed node's transitive dependents as skipped.
+  function markSkippedTransitively(startId) {
+    const stack = (successors[startId] || []).slice();
+    while (stack.length > 0) {
+      const id = stack.pop();
+      if (skipped.has(id)) continue;
+      skipped.add(id);
+      for (const succ of successors[id] || []) {
+        if (!skipped.has(succ)) stack.push(succ);
+      }
+    }
+  }
+
+  async function runNode(id) {
+    const node = nodes[id];
+    const opts = node.label !== undefined ? { label: node.label } : undefined;
+    try {
+      const value = await rootScope.agent(node.prompt, opts);
+      if (value === null) {
+        failed.add(id);
+        results[id] = { ok: false, skipped: true, reason: "agent failed" };
+        markSkippedTransitively(id);
+      } else {
+        finished.add(id);
+        results[id] = { ok: true, text: value };
+      }
+    } catch (error) {
+      if (isFatal(error)) throw error;
+      failed.add(id);
+      results[id] = { ok: false, skipped: true, reason: "agent failed" };
+      markSkippedTransitively(id);
+    }
+  }
+
+  function startNode(id) {
+    const p = runNode(id);
+    inFlight.set(id, p);
+    p.then(
+      () => inFlight.delete(id),
+      () => inFlight.delete(id),
+    );
+    return p;
+  }
+
+  // Keep going while there are nodes left to schedule or agents still in
+  // flight: returning with an un-settled agent() leaves an un-awaited call,
+  // which the runtime fails the run for.
+  while (pending.size > 0 || inFlight.size > 0) {
+    let startedAny = false;
+    for (const id of [...pending]) {
+      // Already marked a transitive skip → fill its result and drop it, never launched.
+      if (skipped.has(id)) {
+        pending.delete(id);
+        results[id] = { ok: false, skipped: true, reason: "dependency failed" };
+        startedAny = true;
+        continue;
+      }
+      const deps = nodes[id].deps || [];
+      const allResolved = deps.every(d => finished.has(d) || failed.has(d) || skipped.has(d));
+      if (!allResolved) continue;
+      if (deps.some(d => skipped.has(d) || failed.has(d))) {
+        // A dependency failed or was skipped → this node is transitively skipped.
+        pending.delete(id);
+        skipped.add(id);
+        results[id] = { ok: false, skipped: true, reason: "dependency failed" };
+        startedAny = true;
+      } else {
+        pending.delete(id);
+        startNode(id);
+        startedAny = true;
+      }
+    }
+    if (!startedAny) {
+      if (inFlight.size > 0) {
+        // Wait for one in-flight agent to settle, then re-evaluate ready nodes.
+        await Promise.race([...inFlight.values()]);
+        continue;
+      }
+      break;
+    }
+  }
+
+  // Fill in entries for nodes marked skipped by markSkippedTransitively.
+  for (const id of skipped) {
+    if (results[id] === undefined) {
+      results[id] = { ok: false, skipped: true, reason: "dependency failed" };
+    }
+  }
+  return results;
+}
+
+/**
  * The \`workflow(nameOrRef, args?)\` global.
  *
  * Runs another workflow inline. The child executes in *this* worker and *this*
@@ -766,6 +975,8 @@ async function main() {
     agent: rootScope.agent,
     parallel: parallel,
     pipeline: pipeline,
+    chain: chain,
+    dag: dag,
     phase: rootScope.phase,
     log: rootScope.log,
     workflow: rootScope.workflow,
