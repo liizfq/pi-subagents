@@ -147,4 +147,54 @@ describe("stop_subagent tool", () => {
     expect(textOf(result)).toBe(`Subagent '${id}' is owned by another agent.`);
     await lifecycle.get("session_shutdown")?.();
   });
+
+  it("stops an agent addressed by its handle, aborting the resolved record's own id", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any);
+
+    const id = await spawnBackground(tools);
+    await flush();
+    const registry = (globalThis as any)[MANAGER_KEY];
+    const record = registry.getRecord(id);
+    // A top-level spawn is handed a handle (its type, or a numbered variant).
+    expect(record.handle).toBeTruthy();
+
+    const result = await tools.get("stop_subagent").execute(
+      "tc-stop-by-handle",
+      { id: record.handle },
+      undefined,
+      undefined,
+      ctx(),
+    );
+
+    // The tool must call `manager.abort(record.id)` — the resolved record's
+    // own id — not the raw handle the caller passed.
+    expect(textOf(result)).toBe(`Stopped subagent '${id}'.`);
+    await lifecycle.get("session_shutdown")?.();
+  });
+
+  it("reports when abort does not take effect (return value is false)", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any);
+
+    const id = await spawnBackground(tools);
+    await flush();
+
+    const { AgentManager } = await import("../src/agent-manager.js");
+    const spy = vi.spyOn(AgentManager.prototype, "abort").mockReturnValue(false);
+
+    const result = await tools.get("stop_subagent").execute(
+      "tc-abort-false",
+      { id },
+      undefined,
+      undefined,
+      ctx(),
+    );
+
+    expect(textOf(result)).toContain("did not take effect");
+    spy.mockRestore();
+    await lifecycle.get("session_shutdown")?.();
+  });
 });

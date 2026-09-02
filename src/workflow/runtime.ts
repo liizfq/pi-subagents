@@ -1020,7 +1020,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     const idleWarnMs = options.idleWarnMs ?? IDLE_WARN_MS;
     const idleStalledMs = options.idleStalledMs ?? IDLE_STALLED_MS;
     const phaseTimeoutMs = options.phaseTimeoutMs ?? PHASE_TIMEOUT_MS;
-    let watchdogState: "idle" | "warned" | "stalled" = "idle";
+    let watchdogState: "idle" | "warned" | "stalled" | "killed" = "idle";
     const reportedStuckAgents = new Set<string>();
     const deliveryGraceMs = options.deliveryGraceMs ?? DELIVERY_GRACE_MS;
     watchdog = setInterval(() => {
@@ -1074,7 +1074,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           ? Date.now() - lastProgressAt(progress, runStartedAt)
           : 0;
       if (idleMs > phaseTimeoutMs) {
-        finish({ status: "killed", error: `Phase timed out after ${phaseTimeoutMs}ms idle.` });
+        // Notification-only: the watchdog emits run_status:"killed" but does NOT
+        // settle the run — the run keeps going so the user can still intervene.
+        if (watchdogState !== "killed") {
+          watchdogState = "killed";
+          emit([{ type: "run_status", state: "killed", idleMs }]);
+        }
         return;
       }
       if (idleMs > idleStalledMs) {

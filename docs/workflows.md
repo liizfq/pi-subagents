@@ -89,7 +89,7 @@ A run can also be stopped without opening the inspector: the model — or the ma
 
 How a script converges is up to it, but the shape that works is the same every time: wrap each phase in a `runPhase()`-style `try/catch` that records the outcome, and put a top-level `try/catch/finally` around the whole run that returns a terminal object. Pending `agent()` calls reject on abort as a *catchable fatal error* — not as `null` — so `parallel()`/`pipeline()` rethrow rather than folding an abort into an item and carrying on. Assign `__onWorkflowAbort` if you need to tidy up (persist a report, close handles) inside the grace window. The shipped [`run-phase.js`](../examples/workflows/run-phase.js) shows the whole pattern, and runs in CI so it cannot rot.
 
-A run that goes quiet for a long stretch is watched rather than silently hung: **only when no agent is in flight** — a run with an agent still working is never flagged, since the runtime cannot tell a deeply-analysing agent from a hung one. With nothing running, idle for three minutes emits an idle warning, for ten it is flagged **stalled** (a warning, not a completion — the run keeps going and stays reachable from the inspector), and with thirty minutes of no agent activity it is stopped as timed out. These are defaults, not promises — they are tunable in the runtime, not in the tool call.
+A run that goes quiet for a long stretch is watched rather than silently hung: **only when no agent is in flight** — a run with an agent still working is never flagged, since the runtime cannot tell a deeply-analysing agent from a hung one. With nothing running, idle for three minutes emits an idle warning, for ten it is flagged **stalled** (a warning, not a completion — the run keeps going and stays reachable from the inspector), and with thirty minutes of no agent activity it is flagged **killed** (a notification, not a stop — the run keeps going). These are defaults, not promises — they are tunable in the runtime, not in the tool call.
 
 A second completion-delivery check covers a narrower failure: when a child record has already reached a terminal state (or vanished) but the host has not returned its result to the workflow's pending `agent()` call. After a 30-second delivery grace (`deliveryGraceMs` in the runtime), that call fails fatally with the child label and record id instead of leaving the workflow heartbeating forever. A child still queued or running is exempt. If the existing agent-level detector marks an in-flight child `suspicious`, the workflow remains running; once it marks the child `stuck`, the workflow emits a one-time visible agent-level diagnostic (`run_status`) without treating the whole workflow as stalled.
 
@@ -105,7 +105,7 @@ Because it changes nothing, `c` works at both levels and on an agent that has al
 
 A run's own agents are not listed separately in the fleet list, the widget, the `/agents` menus or `@handle` resolution — they belong to the run, which reports for them. `c` in the inspector is the one way in to a child's conversation.
 
-If the agent-level stuck detector marks a child as `stuck`, including during a resumed `agent({ resume })` call, the workflow records one `agent_stuck` status and the main agent receives a short follow-up notification naming the workflow and child label. A `suspicious` state remains internal and does not notify or stop the workflow; repeated identical state callbacks are suppressed, and healthy recovery is reported once. The diagnostic is separate from the final workflow completion notification. The existing terminal/missing result-delivery watchdog remains a fallback for children whose result cannot be delivered.
+If the agent-level stuck detector marks a child as `stuck`, including during a resumed `agent({ resume })` call, the workflow records one `agent_stuck` status and a short follow-up notification naming the workflow and child label is sent. That notification is **routed to the configured `stuckNotificationTarget` when it resolves to a running agent** (an agent type such as `Explore` or an agent id); **otherwise — no target set, or the target resolves to no running agent — it falls back to the main agent**. The `agent_stuck` diagnostic is notification-only: a `suspicious` state remains internal and never notifies or stops the workflow, and a `stuck` state does not stop or abort the run — the child keeps going. Repeated identical state callbacks are suppressed, and healthy recovery is reported once. The diagnostic is separate from the final workflow completion notification. The existing terminal/missing result-delivery watchdog remains a fallback for children whose result cannot be delivered.
 
 ### 4. Edit and re-run
 
@@ -277,6 +277,55 @@ await parallel(thunks)             // barrier: waits for all of them
 
 Prefer `pipeline` unless a stage genuinely needs every prior result *together* — deduplicating across the whole set, deciding whether to continue at all, or a prompt that compares one result against all the others. Needing to flatten, map or filter is not such a case; do that inside a pipeline stage.
 
+### `chain()`
+
+```js
+await chain(steps)   // strictly serial; short-circuits at the first failed step
+```
+
+**`chain` is the serial counterpart to `pipeline`.** `pipeline` advances each *item* through stages independently (item A in stage 3 while item B is still in stage 1). `chain` is a single ordered path: step N+1 runs only after step N completes, and the first step whose `agent()` returns `null` (failed or skipped) stops the chain. Use it for steps that genuinely depend on the previous step's output — a discovery step, then a step that consumes that result, then a verification step on the combined result.
+
+On success it returns `{ ok: true }`; on failure it returns `{ ok: false, failedAt: "<step>"`, naming the step that failed, and no later step runs. A fatal run error (a cap breach or an abort) rethrows, so the run fails rather than the chain carrying on. Each step is validated as a non-empty string up front, and a single `chain()` call accepts at most 4096 steps.
+
+```js
+phase('Fix')
+const plan = await agent('Diagnose the failing build and list the exact files to change.')
+const result = await chain([
+  'Apply the file changes the diagnosis called for and run the test suite.',
+  'Verify the fix held: re-run the suite and confirm it is green.',
+])
+return result
+```
+
+### `dag()`
+
+```js
+await dag({ nodes })   // nodes: { [id]: { prompt, deps?, label? } }
+```
+
+**`dag` is the DAG scheduler.** Where `parallel` is a barrier and `pipeline` advances each item through stages independently, `dag` lets you declare dependencies between named steps. Each node is `{ prompt, deps?, label? }`; `deps` is the list of node ids that must finish before this node may start. The runtime topologically sorts the graph — a dependency cycle fails the run, naming the nodes in it — and then runs every node whose dependencies have all resolved **concurrently**. The run's own concurrency cap (`max(1, min(16, cpus - 2))`), not the script, bounds how many of those agents actually run at once.
+
+A node whose `agent()` fails (resolves to `null`) marks itself and **all of its transitive dependents** as `skipped`; the dependents are never launched. The result is a map of node id to `{ ok, text?, skipped?, reason? }`: successful nodes are `{ ok: true, text }`, a failed node is `{ ok: false, skipped: true, reason: "agent failed" }`, and a transitively-skipped node is `{ ok: false, skipped: true, reason: "dependency failed" }`.
+
+```js
+phase('Build')
+const result = await dag({
+  nodes: {
+    research:  { prompt: "Research the feature" },
+    design:    { prompt: "Design based on the research", deps: ["research"] },
+    implement: { prompt: "Implement the design", deps: ["design"] },
+    test:      { prompt: "Write and run tests", deps: ["implement"] },
+    docs:       { prompt: "Update the docs", deps: ["implement"] },
+  },
+})
+// On success every node reads { ok: true, text: "..." }.
+// If `implement` failed, `test` and `docs` (its dependents) come back
+// as { ok: false, skipped: true, reason: "dependency failed" } and never run.
+return result
+```
+
+A single `dag()` call accepts at most 4096 nodes.
+
 ### `workflow(nameOrRef, args?)`
 
 Runs a saved workflow inline and returns its value. Pass a name, or `{ scriptPath }`. `args` becomes the child's `args` global.
@@ -311,7 +360,7 @@ The run-status snapshot is written the moment a run settles — completed, faile
 |---|---|
 | Agents running at once | `max(1, min(16, cpus - 2))` — 6 on an 8-core machine |
 | Agents per run, total | 1000 |
-| Items per `parallel`/`pipeline` **call** | 4096 |
+| Items per `parallel`/`pipeline`/`chain`/`dag` **call** | 4096 |
 | Nested `workflow()` calls per run | 256 |
 | Script length | 512 KiB |
 
@@ -440,7 +489,7 @@ Different:
 - **`schema` is pressured, not forced** — see the troubleshooting entry above.
 - If both extensions are loaded, this one **stands down** rather than offering the model two orchestrators.
 
-Additions on this side: `gate`, `resume`, `effort`, journal-backed `resumeFromRunId`, and the un-awaited-`agent()` check. All are optional, which is what keeps a Claude Code script portable.
+Additions on this side: `chain()`, `dag()`, `gate`, `resume`, `effort`, journal-backed `resumeFromRunId`, and the un-awaited-`agent()` check. All are optional, which is what keeps a Claude Code script portable. `chain(steps)` is the strictly-serial, failure-short-circuiting primitive: steps run one after another, and the first failed step stops the run. `dag({ nodes })` is the DAG scheduler: nodes declare their `deps`, the graph is topologically sorted (a cycle fails the run), ready nodes run concurrently, and a failed node skips all of its transitive dependents.
 
 ## Examples
 

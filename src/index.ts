@@ -19,7 +19,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getStuckAiIntervalMs, getStuckAiModel, getStuckDetection, getStuckGraceWindows, getStuckRepeatThreshold, getStuckRuleIntervalMs, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setStuckAiIntervalMs, setStuckAiModel, setStuckDetection, setStuckGraceWindows, setStuckRepeatThreshold, setStuckRuleIntervalMs, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getStuckAiIntervalMs, getStuckAiModel, getStuckDetection, getStuckGraceWindows, getStuckNotificationTarget, getStuckRepeatThreshold, getStuckRuleIntervalMs, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setStuckAiIntervalMs, setStuckAiModel, setStuckDetection, setStuckGraceWindows, setStuckNotificationTarget, setStuckRepeatThreshold, setStuckRuleIntervalMs, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -1433,6 +1433,7 @@ export default function (pi: ExtensionAPI) {
       setStuckGraceWindows,
       setStuckAiModel,
       setStuckAiIntervalMs,
+      setStuckNotificationTarget,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -2367,22 +2368,35 @@ Terse command-style prompts produce shallow, generic work.
           for (const entry of entries) {
             if (entry.type !== "run_status" || entry.state !== "agent_stuck") continue;
             const key = `agent-stuck-${task.id}-${entry.agentId ?? entry.agentLabel ?? "unknown"}`;
+            const target = getStuckNotificationTarget();
             scheduleNudge(key, () => {
-              pi.sendMessage<NotificationDetails>({
-                customType: "subagent-notification",
-                content: `Workflow "${task.workflowName ?? task.id}" agent "${entry.agentLabel ?? "unknown"}" appears stuck.`,
-                display: true,
-                details: {
-                  id: task.id,
-                  description: `Workflow ${task.workflowName ?? task.id}`,
-                  status: "running",
-                  toolUses: task.totalToolCalls,
-                  turnCount: 0,
-                  totalTokens: task.totalTokens,
-                  durationMs: elapsedMs(task, Date.now()),
-                  resultPreview: "",
-                },
-              }, { deliverAs: "followUp", triggerTurn: true });
+              const msg = `Workflow "${task.workflowName ?? task.id}" agent "${entry.agentLabel ?? "unknown"}" appears stuck.`;
+              // Route the notification to the target agent's session when the
+              // target resolves to a running agent (an agent type or id);
+              // otherwise fall back to the main agent.
+              const record = target
+                ? manager.getRecord(target)
+                  ?? manager.listAgents().find(r => r.type === target && r.status === "running")
+                : undefined;
+              if (record) {
+                manager.steer(record.id, msg);
+              } else {
+                pi.sendMessage<NotificationDetails>({
+                  customType: "subagent-notification",
+                  content: msg,
+                  display: true,
+                  details: {
+                    id: task.id,
+                    description: `Workflow ${task.workflowName ?? task.id}`,
+                    status: "running",
+                    toolUses: task.totalToolCalls,
+                    turnCount: 0,
+                    totalTokens: task.totalTokens,
+                    durationMs: elapsedMs(task, Date.now()),
+                    resultPreview: "",
+                  },
+                }, { deliverAs: "followUp", triggerTurn: true });
+              }
             });
           }
         },
@@ -3039,8 +3053,15 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status !== "running" && record.status !== "queued") {
         return textResult(`Subagent '${params.id}' is already settled (status: ${record.status}).`);
       }
-      manager.abort(params.id);
-      return textResult(`Stopped subagent '${params.id}'.`);
+      // Abort the resolved record's OWN id, not the raw `params.id`: the caller
+      // may have passed a handle or alias, and `manager.abort` only looks up by
+      // record id. Check the return value so a stop that did not take effect
+      // is reported rather than claimed as stopped.
+      const stopped = manager.abort(record.id);
+      if (!stopped) {
+        return textResult(`Subagent '${record.id}': stop did not take effect (status: ${record.status}).`);
+      }
+      return textResult(`Stopped subagent '${record.id}'.`);
     },
   }));
 
@@ -3652,6 +3673,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       stuckGraceWindows: getStuckGraceWindows(),
       stuckAiModel: getStuckAiModel(),
       stuckAiIntervalMs: getStuckAiIntervalMs(),
+      stuckNotificationTarget: getStuckNotificationTarget() || undefined,
     } satisfies SubagentsSettings;
   }
 
@@ -3908,6 +3930,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           currentValue: String(getStuckAiIntervalMs()),
           values: [String(getStuckAiIntervalMs())],
         },
+        {
+          id: "stuckNotificationTarget",
+          label: "Stuck notification target",
+          description: "Agent type or id that receives agent_stuck notifications (empty = main agent)",
+          currentValue: getStuckNotificationTarget(),
+          values: [getStuckNotificationTarget()],
+        },
       ];
     }
 
@@ -4102,6 +4131,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
           setStuckAiIntervalMs(n);
           notifyApplied(ctx, `Stuck AI interval set to ${n}ms`);
         }
+      } else if (id === "stuckNotificationTarget") {
+        setStuckNotificationTarget(value);
+        notifyApplied(ctx, value.trim()
+          ? `Stuck notification target set to ${value.trim()}`
+          : "Stuck notification target cleared (main agent)");
       }
     }
 

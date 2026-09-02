@@ -382,6 +382,7 @@ let stuckRepeatThreshold = DEFAULT_STUCK_REPEAT_THRESHOLD;
 let stuckGraceWindows = DEFAULT_STUCK_GRACE_WINDOWS;
 let stuckAiModel = DEFAULT_STUCK_AI_MODEL;
 let stuckAiIntervalMs = DEFAULT_STUCK_AI_INTERVAL_MS;
+let stuckNotificationTarget: string = "";
 
 export function getStuckDetection(): StuckDetectionMode { return stuckDetection; }
 export function setStuckDetection(mode: StuckDetectionMode): void {
@@ -406,6 +407,11 @@ export function setStuckAiModel(model: string): void {
 export function getStuckAiIntervalMs(): number { return stuckAiIntervalMs; }
 export function setStuckAiIntervalMs(n: number): void {
   if (Number.isFinite(n)) stuckAiIntervalMs = Math.min(STUCK_AI_INTERVAL_CEILING, Math.max(60_000, Math.floor(n)));
+}
+export function getStuckNotificationTarget(): string { return stuckNotificationTarget; }
+export function setStuckNotificationTarget(target: string): void {
+  if (target.trim()) stuckNotificationTarget = target.trim();
+  else stuckNotificationTarget = "";
 }
 
 /**
@@ -1236,7 +1242,7 @@ export async function runAgent(
   };
 
   const markStuck = () => {
-    if (aborted || settled || stuckAbortReason !== undefined) return;
+    if (aborted || settled) return;
     if (!stuckAbortPending) {
       stuckAbortPending = true;
       reportState("stuck");
@@ -1246,10 +1252,9 @@ export async function runAgent(
       }
       return;
     }
+    // Notification-only: the second stuck window no longer aborts the session.
+    // The steer was already sent; the agent continues running.
     stuckAbortPending = false;
-    stuckAbortReason = "The agent was aborted after sustained stuck activity.";
-    aborted = true;
-    session.abort();
   };
 
   const cancelPendingStuckAbort = (): void => {
@@ -1261,7 +1266,7 @@ export async function runAgent(
   };
 
   const evaluateDetection = async () => {
-    if (!detector || settled || aborted || stuckAbortReason !== undefined) return;
+    if (!detector || settled || aborted) return;
     const evaluation = detector.evaluate(Date.now());
     if (evaluation.status === "healthy") {
       cancelPendingStuckAbort();
@@ -1477,7 +1482,7 @@ export async function resumeAgent(
     try { void Promise.resolve(session.steer(message)).catch(() => {}); } catch { /* disposed session */ }
   };
   const markStuck = (): void => {
-    if (aborted || settled || stuckAbortReason !== undefined) return;
+    if (aborted || settled) return;
     if (!stuckAbortPending) {
       stuckAbortPending = true;
       reportState("stuck");
@@ -1487,10 +1492,8 @@ export async function resumeAgent(
       }
       return;
     }
+    // Notification-only: the second stuck window no longer aborts the session.
     stuckAbortPending = false;
-    stuckAbortReason = "The agent was aborted after sustained stuck activity.";
-    aborted = true;
-    session.abort();
   };
   const cancelPending = (): void => {
     if (!stuckAbortPending) return;

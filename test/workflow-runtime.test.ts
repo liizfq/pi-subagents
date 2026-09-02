@@ -1000,7 +1000,7 @@ describe("watchdog", () => {
     expect(states).toEqual(["stuck"]);
   });
 
-  it("warns, then stalls, then kills a run whose script is wedged with no agent in flight", async () => {
+  it("warns, then stalls, then emits killed status (notification-only — no finish)", async () => {
     // An agent that completes, then a script await that never resolves: no
     // agent is in flight, so the idle clock runs and the watchdog fires.
     const controller = new AbortController();
@@ -1024,22 +1024,24 @@ describe("watchdog", () => {
     });
 
     try {
-      const result = await Promise.race([promise, sleep(3000).then(() => undefined)]);
-      expect(result).toBeDefined();
-      expect(result!.status).toBe("killed");
-      expect(String(result!.error)).toContain("timed out");
+      // Wait until the "killed" status has been emitted.
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && !statuses.includes("killed")) {
+        await sleep(10);
+      }
       expect(statuses).toContain("idle_warning");
       expect(statuses).toContain("stalled");
+      expect(statuses).toContain("killed");
       expect(stalled.length).toBeGreaterThan(0);
-      // The interval stops producing once the run settles: another window must
-      // not emit any further run_status entries.
-      const after = statuses.length;
-      await sleep(80);
-      expect(statuses.length).toBe(after);
+
+      // The run is NOT settled by the watchdog: abort it explicitly.
+      controller.abort();
+      const result = await promise;
+      expect(result.status).toBe("killed"); // by the abort, not the watchdog
     } finally {
       controller.abort();
     }
-  });
+  }, 8000);
 
   it("fails visibly when a terminal child never delivers its result", async () => {
     const { host } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));

@@ -2855,7 +2855,7 @@ describe("agent-runner stuck steer grace", () => {
     };
   }
 
-  it("steers on the first stuck evaluation and aborts only on the next window", async () => {
+  it("steers on the first stuck evaluation and does NOT abort (notification-only)", async () => {
     const detector = {
       record: vi.fn(),
       evaluate: vi.fn(() => stuck),
@@ -2869,7 +2869,9 @@ describe("agent-runner stuck steer grace", () => {
       expect(run.session.abort).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(intervalMs);
-      expect(run.session.abort).toHaveBeenCalledTimes(1);
+      // Notification-only: a second stuck window does NOT trigger session.abort()
+      expect(run.session.abort).not.toHaveBeenCalled();
+      expect(run.session.steer).toHaveBeenCalledTimes(1);
     } finally {
       run.finish();
       await run.runPromise;

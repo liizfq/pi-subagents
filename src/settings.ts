@@ -307,6 +307,15 @@ export interface SubagentsSettings {
    * Markdown is lossy in ways that look like the tool misbehaved — see
    * `ViewerMarkdownMode` for the specific rewrites — so `all` is opt-in.
    */
+  /**
+   * Which subagent should receive `agent_stuck` notifications. A non-empty
+   * string (agent type or id) routes the nudge to that agent's session.
+   * Empty or absent means the notification goes to the main agent (default).
+   *
+   * Only non-empty, non-whitespace strings survive sanitization.
+   */
+  stuckNotificationTarget?: string;
+
   viewerMarkdown?: ViewerMarkdownMode;
 }
 
@@ -344,6 +353,7 @@ export interface SettingsAppliers {
   setStuckGraceWindows?: (n: number) => void;
   setStuckAiModel?: (model: string) => void;
   setStuckAiIntervalMs?: (n: number) => void;
+  setStuckNotificationTarget?: (target: string) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -486,6 +496,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (Number.isInteger(r.stuckAiIntervalMs) && (r.stuckAiIntervalMs as number) >= 60_000 && (r.stuckAiIntervalMs as number) <= STUCK_AI_INTERVAL_CEILING) {
     out.stuckAiIntervalMs = r.stuckAiIntervalMs as number;
   }
+  if (typeof r.stuckNotificationTarget === "string" && (r.stuckNotificationTarget as string).trim()) {
+    out.stuckNotificationTarget = (r.stuckNotificationTarget as string).trim();
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -578,6 +591,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.stuckGraceWindows === "number") appliers.setStuckGraceWindows?.(s.stuckGraceWindows);
   if (typeof s.stuckAiModel === "string") appliers.setStuckAiModel?.(s.stuckAiModel);
   if (typeof s.stuckAiIntervalMs === "number") appliers.setStuckAiIntervalMs?.(s.stuckAiIntervalMs);
+  if (typeof s.stuckNotificationTarget === "string") appliers.setStuckNotificationTarget?.(s.stuckNotificationTarget);
 }
 
 /**
